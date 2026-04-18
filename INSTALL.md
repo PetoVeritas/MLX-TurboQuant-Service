@@ -1,7 +1,7 @@
 # INSTALL
 
 This project is a local MLX-backed inference service for Apple Silicon Macs.
-It is not a one-click app yet. A new machine needs four things:
+It is not a one-click app. A new machine needs four things:
 
 1. the repository code
 2. a local Python runtime for the worker
@@ -10,10 +10,11 @@ It is not a one-click app yet. A new machine needs four things:
 
 ## Requirements
 
-- Apple Silicon Mac
-- Python 3.11 or newer
-- local model files for a supported MLX Gemma model
-- a Python environment that can import `mlx_lm`
+- **Apple Silicon Mac.** Intel Macs are not supported.
+- **32GB unified memory or more.** The default 26B 4-bit model needs roughly 15GB for weights, plus headroom for KV cache and the rest of macOS. 16GB Macs will OOM during model load; 32GB is the practical floor, 64GB is comfortable.
+- **Python 3.14.** Tested on 3.14.4. Minimum supported is 3.11, but recent 3.13 / 3.14 patch versions are what's actively tested. If you don't already have 3.14, install it via Homebrew: `brew install python@3.14`.
+- **~20GB of free disk space** for the default model. More if you plan to try other variants.
+- **HuggingFace CLI** for the model download step: `pip install "huggingface_hub[cli]"`.
 
 ## What is in GitHub vs what is local
 
@@ -43,32 +44,41 @@ cd mlx-turbo-gemma-service
 The supervisor is standard-library Python and is started by `./scripts/start` using `python3`.
 The worker is separate and uses the Python executable configured in `config/local.json`.
 
-Create a virtual environment for the worker:
+Create a virtual environment for the worker, using Python 3.14:
 
 ```bash
-python3 -m venv runtime/mlx-python-runtime/.venv
+# Path below assumes Homebrew on Apple Silicon. Adjust if installed elsewhere.
+/opt/homebrew/opt/python@3.14/bin/python3.14 -m venv runtime/mlx-python-runtime/.venv
 source runtime/mlx-python-runtime/.venv/bin/activate
+python --version   # should print 3.14.x
 ```
 
-Install the worker dependency that the code expects:
+Install the worker's runtime dependency:
 
 ```bash
+pip install --upgrade pip
 pip install mlx-lm
 ```
 
+The service is currently tested with `mlx-lm==0.31.2`. Later versions will likely work, but if you hit a regression after upgrading, pinning to the tested version is a good first troubleshooting step.
+
 Notes:
 - The worker imports `mlx_lm` directly.
-- If your local MLX setup requires extra packages or a specific `mlx-lm` version, install those in this same virtual environment.
-- The repo does not currently pin worker dependencies in a lockfile, so if you want reproducible installs across machines, add that separately.
+- The repo does not currently ship a pinned dependency file. If you want reproducible installs across machines, generate one with `pip freeze > requirements.txt` after a known-good install.
 
 ## 3. Download the model
 
-Download a local MLX Gemma model to a directory on disk.
-The current README references:
+The default model is `mlx-community/gemma-4-26b-a4b-it-4bit` (~15GB on disk). Download it to any directory you control:
 
-- `mlx-community/gemma-4-26b-a4b-it-4bit`
+```bash
+huggingface-cli download \
+  mlx-community/gemma-4-26b-a4b-it-4bit \
+  --local-dir ~/models/gemma-4-26b-a4b-it-4bit
+```
 
-You will point `config/local.json` at the local path for that model.
+If the download fails with a 401 or 403, the repo is gated — run `huggingface-cli login` first, accept the license on the HuggingFace web UI for that model, then retry.
+
+You will point `config/local.json` at the absolute path of the downloaded directory in the next step.
 
 ## 4. Create `config/local.json`
 
@@ -144,6 +154,8 @@ Run the smoke test:
 ./scripts/smoke-test
 ```
 
+**First-request latency.** With `worker.lazyLoad` at its default (`true`), the very first request after startup triggers the model load, which can take 15–30 seconds on an M-series Mac depending on the model and disk speed. The smoke test may appear to hang briefly on its first call — that's expected. Subsequent requests are fast.
+
 ## 7. Stop or restart
 
 ```bash
@@ -169,20 +181,29 @@ Instead of hardcoding some values in `config/local.json`, the service also suppo
 Set `model.path` in `config/local.json`.
 
 ### `mlx_model_path_missing:...`
-The configured model path does not exist on disk.
+The configured model path does not exist on disk. Double-check the absolute path and that the model download completed fully.
 
 ### `mlx_runtime_import_failed:...`
-The worker Python environment does not have a working `mlx_lm` install.
+The worker Python environment does not have a working `mlx_lm` install. Confirm `worker.pythonExecutable` points at the right venv and re-run `pip install mlx-lm` inside it.
 
 ### Service starts but `/ready` is not OK
-Check:
+Check in this order:
 - `config/local.json`
 - model path
 - worker Python path
 - `tmp/supervisor.log`
 
-### Port conflict
-Change `server.port` in `config/local.json`.
+### Port conflict (`address already in use`)
+Something else is bound to port 4017. Either stop the other process or change `server.port` in `config/local.json`.
+
+### Worker keeps restarting
+Tail `tmp/supervisor.log` and grep for `worker_terminated` or tracebacks. Most common causes: OOM during model load, a bad model path, or an `mlx-lm` version mismatch.
+
+### OOM during model load
+The default 26B 4-bit model needs roughly 15GB of unified memory for weights, plus overhead for KV cache and macOS. On a 16GB Mac it will OOM. Either run on a larger machine, or switch to a smaller model (a 2B or 4B MLX variant) and update `model.id` / `model.path` in `config/local.json` accordingly.
+
+### `huggingface-cli download` fails with 401 / 403
+The model repo is gated. Run `huggingface-cli login`, accept the license on the HuggingFace web UI for that model, and retry the download.
 
 ## Reproducibility note
 
@@ -191,4 +212,4 @@ The repository is enough to share the app itself, but a fresh machine still need
 - local model files
 - local config
 
-If you want fully reproducible setup for other people, the next improvement should be a pinned dependency file for the worker environment plus a tighter first-run setup section in `README.md`.
+If you want fully reproducible setup for other people, the next improvement should be a pinned `requirements.txt` for the worker environment plus a tighter first-run setup section in `README.md`.
