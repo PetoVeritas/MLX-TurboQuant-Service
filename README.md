@@ -130,5 +130,5 @@ It currently supports:
 
 - Apple Silicon Mac
 - Python 3.11+ with an MLX-capable virtualenv (see `runtime/`)
-- local Gemma model files
+- local Gemma model files (e.g., [mlx-community/gemma-4-26b-a4b-it-4bit](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit))
 - OpenClaw-compatible workflow if used as a lane
