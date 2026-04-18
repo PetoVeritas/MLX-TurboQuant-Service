@@ -6,7 +6,7 @@ import itertools
 import json
 import logging
 import os
-import select
+import queue
 import subprocess
 import sys
 import threading
@@ -82,6 +82,10 @@ class WorkerManager:
         self._cooldown_until = 0.0
         self._process: subprocess.Popen[str] | None = None
         self._stderr_handle: Any | None = None
+        # Worker stdout is read by a dedicated daemon thread so we never call
+        # select() on a Python BufferedReader (see _stdout_reader_loop for the
+        # full story). The queue holds raw bytes lines; None signals EOF/error.
+        self._stdout_queue: "queue.Queue[bytes | None] | None" = None
         self._root_dir = Path(__file__).resolve().parents[2]
         self._request_counter = itertools.count(1)
         self._worker_start_timeout = max(1, int(self._config.get("worker", {}).get("startupTimeoutMs", 120000)) // 1000)
@@ -251,6 +255,7 @@ class WorkerManager:
 
     def _reset_to_not_loaded(self) -> None:
         self._process = None
+        self._stdout_queue = None
         self._close_stderr_handle()
         self._set_not_loaded_state(error=None)
 
@@ -301,6 +306,7 @@ class WorkerManager:
         if self._process and self._process.poll() is not None:
             code = self._process.returncode
             self._process = None
+            self._stdout_queue = None
             self._close_stderr_handle()
             self._record_failure_locked(
                 FAILURE_CRASH,
@@ -459,6 +465,21 @@ class WorkerManager:
                 stderr=self._stderr_handle,
                 env=env,
             )
+            # Dedicated daemon thread drains worker stdout into a queue so
+            # _read_message never has to select() on a BufferedReader. select()
+            # only watches the underlying fd, so when readline() over-reads
+            # into the BufferedReader's internal buffer (e.g. a flush-chunk
+            # and the completion_result arriving close together), the second
+            # message sits invisibly in Python memory while select() waits on
+            # a drained fd — producing intermittent 240s hangs.
+            self._stdout_queue = queue.Queue()
+            reader = threading.Thread(
+                target=self._stdout_reader_loop,
+                args=(self._process, self._stdout_queue),
+                daemon=True,
+                name=f"worker-stdout-reader-{self._process.pid}",
+            )
+            reader.start()
         # Block for the bootstrap message OUTSIDE _state_lock so readers stay
         # responsive even during a slow cold-load.
         try:
@@ -492,21 +513,51 @@ class WorkerManager:
             ),
         )
 
+    def _stdout_reader_loop(
+        self,
+        proc: "subprocess.Popen[bytes]",
+        q: "queue.Queue[bytes | None]",
+    ) -> None:
+        """Drain worker stdout into the queue, one JSON-newline line per entry.
+
+        Runs in a daemon thread for the lifetime of a single worker process.
+        On EOF (worker exit) or unexpected error we push a single ``None``
+        sentinel so a blocked ``_read_message`` can distinguish "worker died"
+        from "timeout waiting for next message".
+        """
+
+        stdout = proc.stdout
+        if stdout is None:
+            q.put(None)
+            return
+        try:
+            while True:
+                line = stdout.readline()
+                if not line:
+                    q.put(None)
+                    return
+                q.put(line)
+        except Exception:
+            try:
+                q.put(None)
+            except Exception:
+                pass
+
     def _read_message(self, timeout_seconds: int, *, timeout_metric: str | None = None) -> dict[str, Any]:
-        # Snapshot the process pointer so we're not racing against admin
-        # preempt/unload while waiting on select.
-        proc = self._process
-        stdout = proc.stdout if proc is not None else None
-        if proc is None or stdout is None:
+        # Snapshot the queue so we're not racing against admin preempt/unload
+        # while waiting. If the worker was torn down concurrently the queue
+        # reference will be None and we surface that as "stdout not available".
+        q = self._stdout_queue
+        if q is None:
             raise RuntimeError("Worker stdout is not available")
-        ready, _, _ = select.select([stdout], [], [], timeout_seconds)
-        if not ready:
+        try:
+            line = q.get(timeout=timeout_seconds)
+        except queue.Empty:
             if timeout_metric is not None:
                 with self._state_lock:
                     self._metrics[timeout_metric] += 1
             raise TimeoutError(f"Timed out waiting for worker response after {timeout_seconds}s")
-        line = stdout.readline()
-        if not line:
+        if line is None:
             raise RuntimeError("Worker exited unexpectedly before sending a response")
         return json.loads(line)
 
@@ -540,6 +591,7 @@ class WorkerManager:
                 pass
         finally:
             self._process = None
+            self._stdout_queue = None
             self._loaded = False
             self._close_stderr_handle()
             LOG.info("worker_terminated %s", json.dumps({"pid": prior_pid, "force": force}, sort_keys=True))
