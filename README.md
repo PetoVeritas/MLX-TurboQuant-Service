@@ -3,6 +3,8 @@
 A local-first inference service for running Gemma 4 on Apple Silicon with MLX, designed to act as an OpenAI-compatible lane for OpenClaw.
 It combines a lightweight HTTP supervisor with a separate worker process so local inference is easier to run, monitor, restart, and validate.
 
+Current 26B setup note: the service currently runs against the base MLX weights at [`mlx-community/gemma-4-26b-a4b-it-4bit`](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit). In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model, not to a separate published 26B TQPlus weight artifact.
+
 ## Why this exists
 
 Getting a model to produce tokens is not enough for real agent use.
