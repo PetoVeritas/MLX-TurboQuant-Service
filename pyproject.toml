@@ -1,0 +1,17 @@
+[project]
+name = "mlx-turbo-gemma-service"
+version = "0.1.0"
+description = "Local-only supervised MLX Turbo Gemma service scaffold"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

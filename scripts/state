@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BASE_URL="${MLX_GEMMA_BASE_URL:-http://127.0.0.1:4017}"
+echo "== /ready =="
+curl -sS "$BASE_URL/ready"
+echo
+
+echo "== /admin/stats =="
+curl -sS "$BASE_URL/admin/stats"
+echo

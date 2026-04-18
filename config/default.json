@@ -1,0 +1,35 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 4017,
+    "adminLocalOnly": true
+  },
+  "model": {
+    "id": "mlx-gemma-test",
+    "path": "",
+    "maxOutputTokens": 1024,
+    "sampling": {
+      "temperature": 0.7,
+      "topP": 0.9
+    }
+  },
+  "worker": {
+    "startupTimeoutMs": 120000,
+    "requestTimeoutMs": 180000,
+    "probeTimeoutMs": 1000,
+    "pythonExecutable": "",
+    "stubMode": false,
+    "lazyLoad": true,
+    "idleUnload": {
+      "enabled": true,
+      "idleMs": 300000
+    },
+    "recycle": {
+      "maxConsecutiveErrors": 3,
+      "cooldownMs": 15000
+    }
+  },
+  "logging": {
+    "level": "info"
+  }
+}

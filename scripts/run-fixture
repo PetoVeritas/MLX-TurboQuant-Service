@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BASE_URL="${MLX_GEMMA_BASE_URL:-http://127.0.0.1:4017}"
+MODEL_ID="${MLX_GEMMA_MODEL_ID:-}"
+OUT_DIR="${MLX_GEMMA_RUN_OUTPUT_DIR:-$ROOT_DIR/tmp/fixture-runs}"
+FIXTURE_PATH="${1:-}"
+
+if [[ -z "$FIXTURE_PATH" ]]; then
+  echo "Usage: $(basename "$0") <fixture.json>" >&2
+  exit 1
+fi
+
+if [[ ! -f "$FIXTURE_PATH" ]]; then
+  if [[ -f "$ROOT_DIR/$FIXTURE_PATH" ]]; then
+    FIXTURE_PATH="$ROOT_DIR/$FIXTURE_PATH"
+  elif [[ -f "$ROOT_DIR/benchmarks/$FIXTURE_PATH" ]]; then
+    FIXTURE_PATH="$ROOT_DIR/benchmarks/$FIXTURE_PATH"
+  else
+    echo "Fixture not found: $FIXTURE_PATH" >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "$OUT_DIR"
+
+wait_for_health() {
+  for _ in {1..40}; do
+    if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "Service did not become healthy at $BASE_URL" >&2
+  exit 1
+}
+
+RUN_META="$(ROOT_DIR="$ROOT_DIR" FIXTURE_PATH="$FIXTURE_PATH" MODEL_ID="$MODEL_ID" BASE_URL="$BASE_URL" python3 - <<'PY'
+import json, os
+from pathlib import Path
+root = Path(os.environ['ROOT_DIR'])
+fixture_path = Path(os.environ['FIXTURE_PATH']).resolve()
+fixture = json.loads(fixture_path.read_text())
+model_id = os.environ.get('MODEL_ID', '').strip()
+if not model_id:
+    try:
+        import urllib.request
+        with urllib.request.urlopen(os.environ.get('BASE_URL', 'http://127.0.0.1:4017') + '/v1/models', timeout=2) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        models = data.get('data') or []
+        if models:
+            candidate = str((models[0] or {}).get('id', '')).strip()
+            if candidate:
+                model_id = candidate
+    except Exception:
+        pass
+if not model_id:
+    import sys
+    sys.path.insert(0, str(root / 'src'))
+    from shared.config import load_config
+    cfg = load_config()
+    candidate = str((cfg.get('model') or {}).get('id', '')).strip()
+    if candidate:
+        model_id = candidate
+if not model_id:
+    raise SystemExit('Could not determine model id')
+messages = fixture.get('messages')
+if not isinstance(messages, list) or not messages:
+    raise SystemExit('Fixture must contain a non-empty messages array')
+prompt_file = fixture.get('promptFile')
+if prompt_file:
+    prompt_path = (fixture_path.parent / prompt_file).resolve()
+    prompt_text = prompt_path.read_text()
+    rewritten = []
+    for message in messages:
+        msg = dict(message)
+        if msg.get('content') == '__LOAD_PROMPT_FILE__':
+            msg['content'] = prompt_text
+        rewritten.append(msg)
+    messages = rewritten
+payload = {
+    'model': model_id,
+    'messages': messages,
+}
+max_tokens = fixture.get('max_tokens')
+if isinstance(max_tokens, int) and max_tokens > 0:
+    payload['max_tokens'] = max_tokens
+result = {
+    'fixture_id': fixture.get('id', fixture_path.stem),
+    'fixture_path': str(fixture_path),
+    'expected': fixture.get('expected', {}),
+    'payload': payload,
+}
+print(json.dumps(result))
+PY
+)"
+
+FIXTURE_ID="$(printf '%s' "$RUN_META" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fixture_id"])')"
+TIMESTAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
+RUN_DIR="$OUT_DIR/${TIMESTAMP}-${FIXTURE_ID}"
+mkdir -p "$RUN_DIR"
+printf '%s\n' "$RUN_META" > "$RUN_DIR/meta.json"
+printf '%s\n' "$RUN_META" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["payload"], indent=2))' > "$RUN_DIR/request.json"
+
+wait_for_health
+HTTP_CODE=""
+for attempt in 1 2 3; do
+  HTTP_CODE="$(curl -sS -o "$RUN_DIR/response.json" -w '%{http_code}' \
+    -X POST "$BASE_URL/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    --data-binary @"$RUN_DIR/request.json")"
+
+  if [[ "$HTTP_CODE" != "503" ]]; then
+    break
+  fi
+
+  if python3 - "$RUN_DIR/response.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, 'r', encoding='utf-8'))
+except Exception:
+    raise SystemExit(1)
+err = data.get('error') or {}
+message = str(err.get('message', '')).lower()
+retryable = err.get('type') == 'worker_failed' and (
+    'not ready' in message or 'cooling down' in message or 'cooldown' in message
+)
+raise SystemExit(0 if retryable else 1)
+PY
+  then
+    sleep 0.5
+    continue
+  fi
+  break
+done
+
+printf '%s\n' "$HTTP_CODE" > "$RUN_DIR/http_status.txt"
+
+RUN_DIR="$RUN_DIR" HTTP_CODE="$HTTP_CODE" BASE_URL="$BASE_URL" python3 - <<'PY'
+import json, os
+from pathlib import Path
+run_dir = Path(os.environ['RUN_DIR'])
+meta = json.loads((run_dir / 'meta.json').read_text())
+expected = meta.get('expected') or {}
+summary = {
+    'base_url': os.environ['BASE_URL'],
+    'fixture_id': meta.get('fixture_id'),
+    'http_status': int(os.environ['HTTP_CODE']),
+}
+response_path = run_dir / 'response.json'
+try:
+    response = json.loads(response_path.read_text())
+except Exception:
+    summary['response_parse_error'] = True
+else:
+    summary['response_parse_error'] = False
+    if 'error' in response:
+        summary['error_type'] = response['error'].get('type')
+        summary['error_message'] = response['error'].get('message')
+    else:
+        choice = ((response.get('choices') or [{}])[0] or {})
+        msg = choice.get('message') or {}
+        usage = response.get('usage') or {}
+        metrics = response.get('metrics') or {}
+        content = str(msg.get('content', ''))
+        must_contain = list(expected.get('mustContainAll') or [])
+        missing = [item for item in must_contain if item not in content]
+        target_shape = expected.get('targetShape')
+        shape_ok = None
+        if target_shape == 'three-bullet-list':
+            lines = [line.strip() for line in content.splitlines() if line.strip()]
+            shape_ok = len(lines) == 3 and all(line.startswith(('- ', '* ')) for line in lines)
+        elif target_shape == 'json-object-only':
+            try:
+                parsed = json.loads(content)
+                shape_ok = isinstance(parsed, dict)
+            except Exception:
+                shape_ok = False
+        summary['finish_reason'] = choice.get('finish_reason')
+        summary['assistant_preview'] = content[:400]
+        summary['usage'] = usage
+        summary['metrics'] = metrics
+        summary['evaluation'] = {
+            'must_contain_all': must_contain,
+            'missing_required_terms': missing,
+            'required_terms_ok': not missing,
+            'target_shape': target_shape,
+            'target_shape_ok': shape_ok,
+            'clean_pass': (not missing) and (shape_ok is not False),
+        }
+(run_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+print(json.dumps(summary, indent=2))
+PY
+
+echo "Saved run to $RUN_DIR"

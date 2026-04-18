@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PID_FILE="$ROOT_DIR/tmp/supervisor.pid"
+LOG_FILE="$ROOT_DIR/tmp/supervisor.log"
+
+mkdir -p "$ROOT_DIR/tmp"
+
+if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo "Supervisor already running with pid $(cat "$PID_FILE")"
+  exit 0
+fi
+
+cd "$ROOT_DIR"
+nohup env PYTHONPATH=src python3 -m supervisor.main >>"$LOG_FILE" 2>&1 &
+echo $! > "$PID_FILE"
+echo "Started supervisor pid $(cat "$PID_FILE")"

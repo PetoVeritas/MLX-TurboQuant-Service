@@ -1,0 +1,23 @@
+{
+  "server": {
+    "port": 4017
+  },
+  "model": {
+    "id": "mlx-gemma-test-local",
+    "path": "/absolute/path/to/model-or-config",
+    "maxOutputTokens": 1024
+  },
+  "worker": {
+    "pythonExecutable": "/absolute/path/to/mlx-python-runtime/.venv/bin/python",
+    "stubMode": false,
+    "lazyLoad": true,
+    "probeTimeoutMs": 1000,
+    "recycle": {
+      "maxConsecutiveErrors": 3,
+      "cooldownMs": 15000
+    }
+  },
+  "logging": {
+    "level": "debug"
+  }
+}

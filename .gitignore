@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# Runtime / logs / scratch
+logs/
+tmp/
+
+# Local config overrides (keep *.example.json checked in)
+config/local.json
+config/*.local.json
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

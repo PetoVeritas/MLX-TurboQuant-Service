@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+find "$ROOT_DIR/benchmarks" -maxdepth 1 -name '*.fixture.json' -type f | sort | while read -r path; do
+  python3 - "$path" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+print(f"{path}\t{data.get('id','(no-id)')}\t{data.get('description','')}")
+PY
+done

@@ -1,0 +1,24 @@
+{
+  "id": "tiny-factual-v1",
+  "description": "Small control prompt for cold/warm latency and basic instruction-following checks.",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are concise and literal. Follow the requested output format exactly."
+    },
+    {
+      "role": "user",
+      "content": "Return exactly three bullet lines in this order and with no extra text: verification phrase: north star velvet, locker: 11, service window: 14:20 UTC"
+    }
+  ],
+  "max_tokens": 48,
+  "expected": {
+    "mustContainAll": [
+      "north star velvet",
+      "11",
+      "14:20 UTC"
+    ],
+    "targetShape": "three-bullet-list",
+    "notes": "Useful as a tiny cold/warm control. Exact wording can vary later, but extra chatter should count against cleanliness."
+  }
+}

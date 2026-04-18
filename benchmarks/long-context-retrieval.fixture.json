@@ -1,0 +1,26 @@
+{
+  "id": "long-context-retrieval-v1",
+  "description": "Long-context retrieval fixture with early, middle, and late planted facts for MLX vs Ollama comparison work.",
+  "promptFile": "long-context-retrieval.prompt.txt",
+  "messages": [
+    {
+      "role": "user",
+      "content": "__LOAD_PROMPT_FILE__"
+    }
+  ],
+  "max_tokens": 96,
+  "expected": {
+    "mustContainAll": [
+      "north star velvet",
+      "Locker 11",
+      "14:20 UTC"
+    ],
+    "targetShape": "three-bullet-list",
+    "plantedFacts": {
+      "early": "The cobalt envelope is stored in Locker 11.",
+      "middle": "The service window for Project Lantern opens at 14:20 UTC.",
+      "late": "The verification phrase is north star velvet."
+    },
+    "notes": "Use the exact same prompt text for MLX and Ollama runs. This fixture is about retrieval accuracy, latency, and output cleanliness under long context."
+  }
+}

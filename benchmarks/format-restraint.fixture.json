@@ -1,0 +1,25 @@
+{
+  "id": "format-restraint-v1",
+  "description": "Mid-sized format and restraint fixture for comparing instruction-following cleanliness across lanes.",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are precise and literal. Do not add commentary. Return only the requested JSON object."
+    },
+    {
+      "role": "user",
+      "content": "Read these notes and return exactly one JSON object with keys in this order: phrase, owner, retry_window, escalation. Notes: verification phrase is ember glass orbit. Ticket owner is Maya Chen. Retry window is 7 minutes. Escalation path is pager-b. Do not add markdown, bullets, or explanation."
+    }
+  ],
+  "max_tokens": 80,
+  "expected": {
+    "mustContainAll": [
+      "ember glass orbit",
+      "Maya Chen",
+      "7 minutes",
+      "pager-b"
+    ],
+    "targetShape": "json-object-only",
+    "notes": "Useful for checking whether a lane follows exact output-shape instructions without wrapper text, markdown, or extra chatter."
+  }
+}

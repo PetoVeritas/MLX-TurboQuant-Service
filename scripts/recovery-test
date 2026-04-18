@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="${MLX_GEMMA_BASE_URL:-http://127.0.0.1:4017}"
+MODEL_ID="${MLX_GEMMA_MODEL_ID:-}"
+
+json() {
+  curl -sS "$@"
+}
+
+resolve_model_id() {
+  BASE_URL="$BASE_URL" python3 - <<'PY'
+import json, os, sys, urllib.request
+try:
+    with urllib.request.urlopen(os.environ['BASE_URL'] + '/v1/models', timeout=2) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+except Exception:
+    sys.exit(1)
+models = data.get('data') or []
+if not models:
+    sys.exit(1)
+candidate = str((models[0] or {}).get('id', '')).strip()
+if not candidate:
+    sys.exit(1)
+print(candidate)
+PY
+}
+
+if [[ -z "$MODEL_ID" ]]; then
+  if ! MODEL_ID="$(resolve_model_id)"; then
+    echo "Could not determine model id from $BASE_URL/v1/models; set MLX_GEMMA_MODEL_ID." >&2
+    exit 1
+  fi
+fi
+
+completion() {
+  local prompt="$1"
+  json -X POST "$BASE_URL/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$prompt\"}],\"max_tokens\":8}"
+  echo
+}
+
+echo "== initial state =="
+json "$BASE_URL/admin/stats"
+echo
+
+echo "== warm worker =="
+completion "Reply with exactly: recovery warm ok"
+
+echo "== restart worker =="
+json -X POST "$BASE_URL/admin/worker/restart"
+echo
+json "$BASE_URL/admin/stats"
+echo
+
+echo "== request after restart =="
+completion "Reply with exactly: restart recovery ok"
+
+echo "== unload worker =="
+json -X POST "$BASE_URL/admin/worker/unload"
+echo
+json "$BASE_URL/admin/stats"
+echo
+
+echo "== request after unload =="
+completion "Reply with exactly: unload recovery ok"
+
+echo "== final state =="
+json "$BASE_URL/admin/stats"
+echo

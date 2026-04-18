@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_FIXTURE = ROOT_DIR / 'benchmarks' / 'tiny-factual.fixture.json'
+MLX_BASE_URL = os.environ.get('MLX_GEMMA_BASE_URL', 'http://127.0.0.1:4017')
+MLX_MODEL_ID = os.environ.get('MLX_GEMMA_MODEL_ID', '')
+OLLAMA_API_URL = os.environ.get('OLLAMA_API_URL', 'http://127.0.0.1:11434/api/chat')
+OLLAMA_V1_MODELS_URL = os.environ.get('OLLAMA_V1_MODELS_URL', 'http://127.0.0.1:11434/v1/models')
+OLLAMA_MODEL_ID = os.environ.get('OLLAMA_MODEL_ID', 'gemma4:26b-a4b-it-q4_K_M')
+OUT_DIR = Path(os.environ.get('MLX_GEMMA_COMPARE_OUTPUT_DIR', str(ROOT_DIR / 'tmp' / 'lane-comparisons')))
+
+
+def load_fixture(arg: str | None):
+    if not arg:
+        path = DEFAULT_FIXTURE
+    else:
+        p = Path(arg)
+        if p.is_file():
+            path = p
+        elif (ROOT_DIR / arg).is_file():
+            path = ROOT_DIR / arg
+        elif (ROOT_DIR / 'benchmarks' / arg).is_file():
+            path = ROOT_DIR / 'benchmarks' / arg
+        else:
+            raise SystemExit(f'Fixture not found: {arg}')
+    fixture = json.loads(path.read_text())
+    messages = fixture.get('messages')
+    if not isinstance(messages, list) or not messages:
+        raise SystemExit('Fixture must contain a non-empty messages array')
+    prompt_file = fixture.get('promptFile')
+    if prompt_file:
+        prompt_text = (path.parent / prompt_file).read_text()
+        rewritten = []
+        for message in messages:
+            msg = dict(message)
+            if msg.get('content') == '__LOAD_PROMPT_FILE__':
+                msg['content'] = prompt_text
+            rewritten.append(msg)
+        messages = rewritten
+    return path, fixture, messages
+
+
+def http_json(url, payload=None, timeout=600):
+    data = None if payload is None else json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+def wait_for_mlx_health():
+    health_url = f'{MLX_BASE_URL}/health'
+    for _ in range(80):
+        try:
+            http_json(health_url, timeout=2)
+            return
+        except Exception:
+            time.sleep(0.25)
+    raise SystemExit(f'MLX service did not become healthy at {MLX_BASE_URL}')
+
+
+def unload_mlx():
+    try:
+        http_json(f'{MLX_BASE_URL}/admin/worker/unload', payload={})
+    except Exception:
+        pass
+
+
+def stop_ollama_model():
+    try:
+        subprocess.run(['ollama', 'stop', OLLAMA_MODEL_ID], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def detect_mlx_model_id():
+    if MLX_MODEL_ID.strip():
+        return MLX_MODEL_ID.strip()
+    data = http_json(f'{MLX_BASE_URL}/v1/models', timeout=10)
+    models = data.get('data') or []
+    for model in models:
+        candidate = str((model or {}).get('id', '')).strip()
+        if candidate:
+            return candidate
+    raise SystemExit('Could not determine MLX model id')
+
+
+def detect_ollama_model_id():
+    if OLLAMA_MODEL_ID.strip():
+        return OLLAMA_MODEL_ID.strip()
+    data = http_json(OLLAMA_V1_MODELS_URL, timeout=10)
+    models = data.get('data') or []
+    for model in models:
+        candidate = str((model or {}).get('id', '')).strip()
+        if candidate:
+            return candidate
+    raise SystemExit('Could not determine Ollama model id')
+
+
+def evaluate(content, expected):
+    must_contain = list(expected.get('mustContainAll') or [])
+    missing = [item for item in must_contain if item not in content]
+    target_shape = expected.get('targetShape')
+    shape_ok = None
+    if target_shape == 'three-bullet-list':
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        shape_ok = len(lines) == 3 and all(line.startswith(('- ', '* ')) for line in lines)
+    elif target_shape == 'json-object-only':
+        try:
+            shape_ok = isinstance(json.loads(content), dict)
+        except Exception:
+            shape_ok = False
+    return {
+        'must_contain_all': must_contain,
+        'missing_required_terms': missing,
+        'required_terms_ok': not missing,
+        'target_shape': target_shape,
+        'target_shape_ok': shape_ok,
+        'clean_pass': (not missing) and (shape_ok is not False),
+    }
+
+
+def run_mlx(messages, fixture, label):
+    model_id = detect_mlx_model_id()
+    payload = {'model': model_id, 'messages': messages}
+    max_tokens = fixture.get('max_tokens')
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        payload['max_tokens'] = max_tokens
+    started = time.time()
+    response = http_json(f'{MLX_BASE_URL}/v1/chat/completions', payload=payload, timeout=900)
+    _ = started
+    choice = ((response.get('choices') or [{}])[0] or {})
+    msg = choice.get('message') or {}
+    content = str(msg.get('content', ''))
+    usage = response.get('usage') or {}
+    metrics = response.get('metrics') or {}
+    return {
+        'label': label,
+        'lane': 'mlx',
+        'base_url': MLX_BASE_URL,
+        'model_id': model_id,
+        'assistant_preview': content[:400],
+        'usage': usage,
+        'metrics': metrics,
+        'evaluation': evaluate(content, fixture.get('expected') or {}),
+        'raw_response': response,
+    }
+
+
+def run_ollama(messages, fixture, label):
+    model_id = detect_ollama_model_id()
+    payload = {
+        'model': model_id,
+        'messages': messages,
+        'stream': False,
+        'think': False,
+    }
+    max_tokens = fixture.get('max_tokens')
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        payload['options'] = {'num_predict': max_tokens}
+    response = http_json(OLLAMA_API_URL, payload=payload, timeout=900)
+    content = str(((response.get('message') or {}).get('content')) or '')
+    usage = {
+        'prompt_tokens': response.get('prompt_eval_count'),
+        'completion_tokens': response.get('eval_count'),
+        'total_tokens': (response.get('prompt_eval_count') or 0) + (response.get('eval_count') or 0),
+    }
+    metrics = {
+        'load_ms': round((response.get('load_duration') or 0) / 1_000_000, 2),
+        'prefill_ms': round((response.get('prompt_eval_duration') or 0) / 1_000_000, 2),
+        'generation_ms': round((response.get('eval_duration') or 0) / 1_000_000, 2),
+        'total_ms': round((response.get('total_duration') or 0) / 1_000_000, 2),
+    }
+    return {
+        'label': label,
+        'lane': 'ollama',
+        'base_url': OLLAMA_API_URL,
+        'model_id': model_id,
+        'assistant_preview': content[:400],
+        'usage': usage,
+        'metrics': metrics,
+        'evaluation': evaluate(content, fixture.get('expected') or {}),
+        'raw_response': response,
+    }
+
+
+def save_run(run_root, result):
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / 'summary.json').write_text(json.dumps({k: v for k, v in result.items() if k != 'raw_response'}, indent=2) + '\n')
+    (run_root / 'response.json').write_text(json.dumps(result['raw_response'], indent=2) + '\n')
+
+
+def main():
+    fixture_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    fixture_path, fixture, messages = load_fixture(fixture_arg)
+    timestamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    out_root = OUT_DIR / f'{timestamp}-{fixture.get("id", fixture_path.stem)}'
+    out_root.mkdir(parents=True, exist_ok=True)
+    (out_root / 'fixture.json').write_text(json.dumps(fixture, indent=2) + '\n')
+
+    wait_for_mlx_health()
+
+    unload_mlx()
+    mlx_cold = run_mlx(messages, fixture, 'mlx-cold')
+    save_run(out_root / 'mlx-cold', mlx_cold)
+
+    mlx_warm = run_mlx(messages, fixture, 'mlx-warm')
+    save_run(out_root / 'mlx-warm', mlx_warm)
+
+    stop_ollama_model()
+    ollama_cold = run_ollama(messages, fixture, 'ollama-cold')
+    save_run(out_root / 'ollama-cold', ollama_cold)
+
+    ollama_warm = run_ollama(messages, fixture, 'ollama-warm')
+    save_run(out_root / 'ollama-warm', ollama_warm)
+
+    rows = []
+    for result in [mlx_cold, mlx_warm, ollama_cold, ollama_warm]:
+        rows.append({
+            'label': result['label'],
+            'lane': result['lane'],
+            'model_id': result['model_id'],
+            'clean_pass': result['evaluation']['clean_pass'],
+            'load_ms': result['metrics'].get('load_ms'),
+            'prefill_ms': result['metrics'].get('prefill_ms'),
+            'generation_ms': result['metrics'].get('generation_ms'),
+            'total_ms': result['metrics'].get('total_ms'),
+            'prompt_tokens': result['usage'].get('prompt_tokens'),
+            'completion_tokens': result['usage'].get('completion_tokens'),
+            'assistant_preview': result['assistant_preview'].replace('\n', ' | '),
+        })
+    (out_root / 'summary-table.json').write_text(json.dumps(rows, indent=2) + '\n')
+    print(json.dumps({'fixture_path': str(fixture_path), 'out_dir': str(out_root), 'rows': rows}, indent=2))
+
+
+if __name__ == '__main__':
+    main()

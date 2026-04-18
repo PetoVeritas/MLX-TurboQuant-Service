@@ -1,0 +1,37 @@
+System: You are running a retrieval benchmark. Answer using only the facts found in the supplied context. Do not invent missing details. If the facts conflict, say so.
+
+Context block begins.
+
+[Padding section A]
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+
+EARLY FACT: The cobalt envelope is stored in Locker 11.
+
+[Padding section B]
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+
+MID FACT: The service window for Project Lantern opens at 14:20 UTC.
+
+[Padding section C]
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+This is neutral benchmark filler used only to create long-context distance. It contains no secret facts.
+
+LATE FACT: The verification phrase is north star velvet.
+
+Context block ends.
+
+Question: What is the verification phrase, which locker holds the cobalt envelope, and when does the Project Lantern service window open? Return the answer as a 3-bullet list in this exact order: verification phrase, locker, service window.

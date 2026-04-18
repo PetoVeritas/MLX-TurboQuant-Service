@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PORT="${MLX_GEMMA_PORT:-4028}"
+MODEL_ID="${MLX_GEMMA_MODEL_ID:-mlx-gemma-test-local}"
+REQUEST_TIMEOUT_MS="${MLX_GEMMA_REQUEST_TIMEOUT_MS:-1000}"
+STUB_DELAY_MS="${MLX_GEMMA_STUB_DELAY_MS:-2200}"
+SERVER_PID=""
+BACKUP_PATH="$(mktemp /tmp/mlx-local-json-backup.XXXXXX)"
+HAD_LOCAL_JSON="0"
+
+cleanup() {
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+
+  if [[ "$HAD_LOCAL_JSON" == "1" ]]; then
+    cp "$BACKUP_PATH" "$ROOT_DIR/config/local.json"
+  else
+    rm -f "$ROOT_DIR/config/local.json"
+  fi
+  rm -f "$BACKUP_PATH"
+}
+trap cleanup EXIT
+
+json_field() {
+  local file="$1"
+  local expr="$2"
+  python3 - "$file" "$expr" <<'PY'
+import json, sys
+path, expr = sys.argv[1], sys.argv[2]
+with open(path, 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+value = data
+for part in expr.split('.'):
+    value = value[part]
+if isinstance(value, bool):
+    print('true' if value else 'false')
+elif value is None:
+    print('null')
+else:
+    print(value)
+PY
+}
+
+assert_eq() {
+  local actual="$1"
+  local expected="$2"
+  local message="$3"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "FAIL: $message (expected '$expected', got '$actual')" >&2
+    exit 1
+  fi
+}
+
+cd "$ROOT_DIR"
+if [[ -f "$ROOT_DIR/config/local.json" ]]; then
+  HAD_LOCAL_JSON="1"
+  cp "$ROOT_DIR/config/local.json" "$BACKUP_PATH"
+else
+  printf '{}' > "$BACKUP_PATH"
+fi
+
+ROOT_DIR="$ROOT_DIR" BACKUP_PATH="$BACKUP_PATH" REQUEST_TIMEOUT_MS="$REQUEST_TIMEOUT_MS" python3 - <<'PY'
+import json, os
+from pathlib import Path
+root = Path(os.environ['ROOT_DIR'])
+path = root / 'config' / 'local.json'
+backup_path = Path(os.environ.get('BACKUP_PATH', ''))
+if backup_path and backup_path.exists():
+    base = json.loads(backup_path.read_text())
+else:
+    base = {}
+base.setdefault('worker', {})['requestTimeoutMs'] = int(os.environ['REQUEST_TIMEOUT_MS'])
+path.write_text(json.dumps(base, indent=2) + '\n')
+PY
+
+MLX_GEMMA_STUB_MODE=1 \
+MLX_GEMMA_PORT="$PORT" \
+MLX_GEMMA_MODEL_ID="$MODEL_ID" \
+MLX_GEMMA_STUB_DELAY_MS="$STUB_DELAY_MS" \
+PYTHONPATH=src \
+python3 -m supervisor.main > /tmp/mlx-timeout-failure-test.log 2>&1 &
+SERVER_PID="$!"
+
+for _ in {1..50}; do
+  if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+
+curl -sS -o /tmp/mlx-timeout-body.json -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"${MODEL_ID}\",\"messages\":[{\"role\":\"user\",\"content\":\"timeout me\"}],\"max_tokens\":32}" \
+  > /tmp/mlx-timeout-status.txt
+
+STATUS_CODE="$(cat /tmp/mlx-timeout-status.txt)"
+assert_eq "$STATUS_CODE" "504" "timeout path should return HTTP 504"
+assert_eq "$(json_field /tmp/mlx-timeout-body.json error.type)" "timeout" "error type should be timeout"
+assert_eq "$(json_field /tmp/mlx-timeout-body.json error.retryable)" "true" "timeout should be retryable"
+
+curl -fsS "http://127.0.0.1:${PORT}/admin/stats" > /tmp/mlx-timeout-stats.json
+assert_eq "$(json_field /tmp/mlx-timeout-stats.json worker.state)" "failed" "worker should move to failed after timeout"
+assert_eq "$(json_field /tmp/mlx-timeout-stats.json worker.last_failure_kind)" "timeout" "failure kind should be timeout"
+assert_eq "$(json_field /tmp/mlx-timeout-stats.json worker.consecutive_failures)" "1" "consecutive failures should increment once"
+assert_eq "$(json_field /tmp/mlx-timeout-stats.json metrics.request_timeouts)" "1" "request_timeouts counter should increment"
+assert_eq "$(json_field /tmp/mlx-timeout-stats.json metrics.forced_kills)" "1" "forced_kills counter should increment"
+assert_eq "$(json_field /tmp/mlx-timeout-stats.json metrics.failed_requests)" "1" "failed_requests counter should increment"
+
+curl -fsS -X POST "http://127.0.0.1:${PORT}/admin/worker/restart" > /tmp/mlx-timeout-restart.json
+assert_eq "$(json_field /tmp/mlx-timeout-restart.json ok)" "true" "admin restart should recover from cooldown/failure state"
+
+curl -fsS "http://127.0.0.1:${PORT}/ready" > /tmp/mlx-timeout-ready-after-restart.json
+assert_eq "$(json_field /tmp/mlx-timeout-ready-after-restart.json ok)" "true" "ready should be true after admin restart"
+assert_eq "$(json_field /tmp/mlx-timeout-ready-after-restart.json worker.consecutive_failures)" "0" "consecutive failures should reset after admin restart"
+assert_eq "$(json_field /tmp/mlx-timeout-ready-after-restart.json worker.last_failure_kind)" "null" "failure kind should clear after admin restart"
+
+printf 'PASS: timeout/failure path verified on port %s (timeout=%sms, stub delay=%sms)\n' "$PORT" "$REQUEST_TIMEOUT_MS" "$STUB_DELAY_MS"

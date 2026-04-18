@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BASE_URL="${MLX_GEMMA_BASE_URL:-http://127.0.0.1:4017}"
+MODEL_ID="${MLX_GEMMA_MODEL_ID:-mlx-gemma-test-local}"
+PID_FILE="$ROOT_DIR/tmp/supervisor.pid"
+
+json_get() {
+  local expr="$1"
+  JSON_GET_EXPR="$expr" python3 -c 'import json, os, sys; cur=json.load(sys.stdin)
+for part in os.environ["JSON_GET_EXPR"].split("."):
+    cur=cur[part]
+print(cur)'
+}
+
+rss_mb() {
+  local pid="$1"
+  if [[ -z "$pid" || "$pid" == "None" ]]; then
+    echo ""
+    return 0
+  fi
+  ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%.1f", $1/1024}'
+}
+
+stats_json() {
+  curl -sS "$BASE_URL/admin/stats"
+}
+
+wait_for_stats() {
+  for _ in {1..40}; do
+    local body
+    body="$(curl -sS "$BASE_URL/admin/stats" 2>/dev/null || true)"
+    if [[ -n "$body" ]]; then
+      printf '%s' "$body"
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+complete_once() {
+  local text="$1"
+  curl -sS -X POST "$BASE_URL/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$text\"}],\"max_tokens\":8}"
+}
+
+measure() {
+  local label="$1"
+  local stats
+  stats="$(wait_for_stats)"
+  local worker_pid supervisor_pid worker_state worker_loaded
+  worker_pid="$(printf '%s' "$stats" | json_get worker.pid)"
+  worker_state="$(printf '%s' "$stats" | json_get worker.state)"
+  worker_loaded="$(printf '%s' "$stats" | json_get worker.loaded)"
+  supervisor_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  printf '%s\tstate=%s\tloaded=%s\tsupervisor_pid=%s\tsupervisor_rss_mb=%s\tworker_pid=%s\tworker_rss_mb=%s\n' \
+    "$label" "$worker_state" "$worker_loaded" "$supervisor_pid" "$(rss_mb "$supervisor_pid")" "$worker_pid" "$(rss_mb "$worker_pid")"
+}
+
+cd "$ROOT_DIR"
+./scripts/start >/dev/null
+wait_for_stats >/dev/null
+
+echo "label\tstate\tloaded\tsupervisor_pid\tsupervisor_rss_mb\tworker_pid\tworker_rss_mb"
+measure "baseline"
+
+echo >/dev/null
+complete_once "Reply with exactly: memory profile cold" >/dev/null
+sleep 1
+measure "after_cold_request"
+
+for i in 1 2 3 4 5; do
+  complete_once "Reply with exactly: memory profile repeat $i" >/dev/null
+  sleep 0.5
+done
+sleep 1
+measure "after_repeated_requests"
+
+curl -sS -X POST "$BASE_URL/admin/worker/unload" >/dev/null
+sleep 1
+measure "after_unload"
+
+./scripts/stop >/dev/null
