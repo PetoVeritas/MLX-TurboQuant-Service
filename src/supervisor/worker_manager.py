@@ -148,13 +148,44 @@ class WorkerManager:
         self._set_state("failed", accepting_requests=False, loaded=False, error=error)
 
     def _record_failure_locked(self, failure_kind: str, error: str, *, loaded: bool | None = None, crash: bool = False) -> None:
+        # Failure taxonomy (see audit: wedge bug fix):
+        #   * Terminal (CONFIG/UNLOAD): the lane cannot recover without admin
+        #     intervention — configuration is broken or a clean shutdown
+        #     failed in a way that leaves the process-lifecycle model unsafe.
+        #     Stay "failed" with admission closed.
+        #   * Recoverable-with-respawn (TIMEOUT/CRASH/PROTOCOL/STARTUP, and
+        #     any explicit ``crash=True``): the worker process is gone or
+        #     cannot be trusted. Previously these transitioned to "failed"
+        #     with ``accepting_requests=False`` and wedged the lane: a
+        #     single hang turned into permanent 503s because
+        #     ``_maybe_release_cooldown_locked`` only runs when cooldown is
+        #     active, and cooldown only activates at
+        #     ``_max_consecutive_errors``. Now we tear down any residual
+        #     process handle and call ``_set_not_loaded_state`` so admission
+        #     reopens (under lazy-load) and the next request triggers a
+        #     clean cold reload.
+        #   * Soft / worker-reported (BACKEND, plus any unclassified kind):
+        #     the worker is probably still healthy for the next request.
+        #     Mark "degraded" but keep admitting so repeated failures
+        #     naturally escalate to cooldown.
         self._consecutive_failures += 1
         self._last_failure_kind = failure_kind
         if self._consecutive_failures >= self._max_consecutive_errors:
             self._activate_cooldown_locked(error=error)
             return
-        next_state = "failed" if failure_kind in {FAILURE_STARTUP, FAILURE_TIMEOUT, FAILURE_CONFIG, FAILURE_UNLOAD} or crash else "degraded"
-        self._set_state(next_state, accepting_requests=False, loaded=loaded, error=error)
+        if failure_kind in {FAILURE_CONFIG, FAILURE_UNLOAD}:
+            self._set_state("failed", accepting_requests=False, loaded=loaded, error=error)
+            return
+        if crash or failure_kind in {FAILURE_STARTUP, FAILURE_TIMEOUT, FAILURE_PROTOCOL, FAILURE_CRASH}:
+            if self._process is not None:
+                try:
+                    self._terminate_process_locked(force=True)
+                except Exception:
+                    pass
+            self._last_error = error
+            self._set_not_loaded_state(error=error)
+            return
+        self._set_state("degraded", accepting_requests=True, loaded=loaded, error=error)
 
     def _model_config_valid(self) -> bool:
         worker_cfg = self._config.get("worker", {})
