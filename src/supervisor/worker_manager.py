@@ -444,14 +444,19 @@ class WorkerManager:
             self._stderr_handle = stderr_path.open("a", encoding="utf-8")
             configured_python = str(self._config.get("worker", {}).get("pythonExecutable", "")).strip()
             worker_python = os.path.expanduser(configured_python) if configured_python else sys.executable
+            # NOTE: binary mode (no text=True, no bufsize=1) is deliberate.
+            # Text-mode Popen with line-buffering raced on back-to-back
+            # streaming requests — worker's next stdin read would block even
+            # though supervisor's write+flush returned cleanly. Binary I/O
+            # bypasses TextIOWrapper entirely on both ends, keeping the JSON+
+            # newline framing intact. See _send / _read_message and
+            # worker/main.py for the matching binary access pattern.
             self._process = subprocess.Popen(
                 [worker_python, "-m", "worker.main"],
                 cwd=str(self._root_dir),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr_handle,
-                text=True,
-                bufsize=1,
                 env=env,
             )
         # Block for the bootstrap message OUTSIDE _state_lock so readers stay
@@ -510,7 +515,7 @@ class WorkerManager:
         stdin = proc.stdin if proc is not None else None
         if proc is None or stdin is None:
             raise RuntimeError("Worker stdin is not available")
-        stdin.write(json.dumps(payload) + "\n")
+        stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
         stdin.flush()
 
     def _terminate_process_locked(self, force: bool = False) -> None:

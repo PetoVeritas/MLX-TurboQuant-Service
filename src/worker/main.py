@@ -12,8 +12,8 @@ from worker.config import load_config
 
 
 def emit(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload) + "\n")
-    sys.stdout.flush()
+    sys.stdout.buffer.write((json.dumps(payload) + "\n").encode("utf-8"))
+    sys.stdout.buffer.flush()
 
 
 def handle_generate(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -72,8 +72,15 @@ def main() -> int:
     config = load_config()
     backend = build_backend(config)
     emit({"type": "worker_started", "pid": os.getpid(), "backend": getattr(backend, "name", "unknown")})
-    for raw in sys.stdin:
-        line = raw.strip()
+    # Binary stdin to match supervisor's binary-mode Popen. Explicit
+    # readline loop avoids `for line in sys.stdin:` which routes through
+    # TextIOWrapper and raced on back-to-back streaming requests.
+    stdin_buffer = sys.stdin.buffer
+    while True:
+        raw_bytes = stdin_buffer.readline()
+        if not raw_bytes:
+            break  # EOF — supervisor closed the pipe
+        line = raw_bytes.decode("utf-8").strip()
         if not line:
             continue
         try:
