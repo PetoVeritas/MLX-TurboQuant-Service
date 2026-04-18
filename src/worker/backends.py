@@ -43,14 +43,19 @@ _PLACEHOLDER_RE = re.compile(r"\u0000MLXTG_STR_(\d+)\u0000")
 # artifact where a leading ``|`` got eaten). Unknown / unexpected names are
 # left alone and later swept up by the defensive ``_CHANNEL_MARKER_RE`` pass.
 _CHANNEL_NAMES = r"thought|thinking|analysis|final|commentary|reflection"
-_CHANNEL_MARKER_RE = re.compile(rf"<\|?channel\|>\s*({_CHANNEL_NAMES})\b", re.IGNORECASE)
+# Both pipes are optional on either side of the channel name. Gemma
+# occasionally drops one of the pipes (seen in the wild: ``<|channel>thought``,
+# ``<channel|>final``), and a strict ``<\|?channel\|>`` missed those cases
+# and leaked raw markup to the client. Making both sides tolerant catches the
+# full variant too without false positives on real text.
+_CHANNEL_MARKER_RE = re.compile(rf"<\|?channel\|?>\s*({_CHANNEL_NAMES})\b", re.IGNORECASE)
 # Liberal matcher for detection — catches unknown / partial / mangled names too.
-_CHANNEL_MARKER_ANY_RE = re.compile(r"<\|?channel\|>\s*[A-Za-z_][\w-]*\b")
+_CHANNEL_MARKER_ANY_RE = re.compile(r"<\|?channel\|?>\s*[A-Za-z_][\w-]*\b")
 # Defensive stripping regex: removes ONLY the marker characters, not any
 # following word. Prevents the strict-unknown path (e.g. a display artifact
 # like "<channel|>The forecast") from eating the first word of real content.
-_CHANNEL_MARKER_BARE_RE = re.compile(r"<\|?channel\|>")
-_STRAY_CONTROL_RE = re.compile(r"<\|(?:message|start|end|return)\|>")
+_CHANNEL_MARKER_BARE_RE = re.compile(r"<\|?channel\|?>")
+_STRAY_CONTROL_RE = re.compile(r"<\|?(?:message|start|end|return)\|?>")
 _HIDDEN_CHANNELS = frozenset({"thought", "thinking", "analysis"})
 
 
@@ -321,6 +326,58 @@ def filter_hallucinated_tool_calls(
     return kept, hallucinated
 
 
+def _build_hallucination_retry_messages(
+    tool_calls: list[dict[str, Any]],
+    error_text: str,
+) -> list[dict[str, Any]]:
+    """Build a synthetic ``assistant(tool_calls=...)`` + ``tool(...)`` pair.
+
+    When every call the model emitted was hallucinated (name not in
+    advertised tools[]), the containment layer replaces the tool_calls
+    with a plain-text ``[tool-call error]`` message and ``finish_reason=stop``.
+    That protects against infinite loops but also leaves the user staring at
+    the error instead of a real answer.
+
+    This helper builds the messages needed to feed the containment error
+    back into the model as a tool-result, so it can recover and answer the
+    user's underlying question directly on a bounded retry.
+    """
+
+    assistant_tool_calls: list[dict[str, Any]] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        assistant_tool_calls.append(
+            {
+                "id": call.get("id") or f"hallucinated_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": (fn.get("name") if isinstance(fn.get("name"), str) else "") or "unknown",
+                    "arguments": (fn.get("arguments") if isinstance(fn.get("arguments"), str) else "") or "{}",
+                },
+            }
+        )
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": assistant_tool_calls,
+        }
+    ]
+    for call in assistant_tool_calls:
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "name": call["function"]["name"],
+                "content": error_text,
+            }
+        )
+    return messages
+
+
 def _decode_assistant_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return a shallow-copied messages list where every assistant.tool_calls[i]
     .function.arguments that is a JSON string has been decoded into a dict.
@@ -517,7 +574,14 @@ class MlxBackend(WorkerBackend):
             raise RuntimeError("mlx_generation_returned_no_result")
         return final_result
 
-    def stream_generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None):
+    def stream_generate(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None,
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        _hallucination_retry_used: bool = False,
+    ):
         prompt = self._build_prompt(messages, tools=tools)
         effective_max_tokens = self._max_output_tokens
         if isinstance(max_tokens, int) and max_tokens > 0:
@@ -599,11 +663,50 @@ class MlxBackend(WorkerBackend):
         if streaming_mode != "text" and buffered_chunks:
             _leftover, _reason, parsed_tool_calls = parse_tool_calls(content)
             if parsed_tool_calls is None:
-                flushed_text = strip_channel_markup("".join(buffered_chunks))
-                if flushed_text:
-                    yield BackendStreamChunk(text=flushed_text)
+                raw_buffered = "".join(buffered_chunks)
+                # If the buffered text contains tool-call markers (``<|tool_call|>``
+                # sentinels or a ``call:<name>`` token) but we couldn't form a
+                # valid parse, it's a malformed tool-call attempt. Skip the
+                # flush — _build_result will produce a clean containment
+                # message — so the raw markup never reaches the client.
+                if not _contains_tool_call_marker(raw_buffered):
+                    flushed_text = strip_channel_markup(raw_buffered)
+                    if flushed_text:
+                        yield BackendStreamChunk(text=flushed_text)
                 buffered_chunks.clear()
-        yield self._build_result(messages, final_response, content, generation_started, tools=tools)
+
+        result = self._build_result(messages, final_response, content, generation_started, tools=tools)
+
+        # Hallucinated-tool recovery. _build_result returns a "[tool-call
+        # error]" content string with finish_reason=stop and tool_calls=None
+        # when every parsed tool_call was hallucinated. Without a retry the
+        # user sees that error as the final answer. Feed it back into the
+        # model as a synthetic tool-result and re-stream so Gemma can answer
+        # the user's underlying question. The recursion guard caps this at
+        # one retry — if the model hallucinates again we fall through to the
+        # containment message, preserving the break-glass safety behavior.
+        if (
+            not _hallucination_retry_used
+            and tools
+            and result.tool_calls is None
+            and isinstance(result.content, str)
+            and result.content.startswith("[tool-call error]")
+        ):
+            _leftover, _reason, original_tool_calls = parse_tool_calls(strip_channel_markup(content))
+            if original_tool_calls:
+                retry_messages = list(messages) + _build_hallucination_retry_messages(
+                    original_tool_calls, result.content
+                )
+                for event in self.stream_generate(
+                    retry_messages,
+                    max_tokens,
+                    tools=tools,
+                    _hallucination_retry_used=True,
+                ):
+                    yield event
+                return
+
+        yield result
 
     def _build_result(
         self,
@@ -650,6 +753,22 @@ class MlxBackend(WorkerBackend):
             and _contains_tool_call_marker(parsed_content)
         ):
             parsed_content = ""
+        # Malformed tool-call emission: the model wrote tool-call sentinels
+        # but the parser could not read them (usually a missing/extra pipe
+        # like `<|tool_call>` / `<tool_call|>`, or a mangled body). Replace
+        # the raw leaked markup with a clean containment message so the
+        # client never sees the internal tokens. Finish as `stop` so the
+        # caller does not retry-loop on a broken call.
+        elif (
+            parsed_tool_calls is None
+            and _contains_tool_call_marker(parsed_content)
+        ):
+            parsed_content = (
+                "[tool-call error] The model emitted a malformed tool call "
+                "that could not be parsed. No tool was executed. Please "
+                "answer without invoking any tool."
+            )
+            parsed_finish_reason = "stop"
 
         # Guard against hallucinated tool names — the model sometimes calls a
         # tool that was not in the request's tools[] list. If every call is
