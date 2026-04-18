@@ -1,8 +1,5 @@
 # MLX TurboQuant Service, tuned for Gemma 4 26B
 
-**Copyright:** © 2026 PetoVeritas  
-**License:** Apache-2.0
-
 A local-first inference service for running Gemma 4 on Apple Silicon with MLX, designed to act as an OpenAI-compatible lane for OpenClaw.
 It combines a lightweight HTTP supervisor with a separate worker process so local inference is easier to run, monitor, restart, and validate.
 
@@ -137,3 +134,9 @@ It currently supports:
 - Python 3.11+ with an MLX-capable virtualenv (see `runtime/`)
 - local Gemma model files (e.g., [mlx-community/gemma-4-26b-a4b-it-4bit](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit))
 - OpenClaw-compatible workflow if used as a lane
+
+---
+
+**Copyright:** © 2026 PetoVeritas  
+**License:** Apache-2.0
+
