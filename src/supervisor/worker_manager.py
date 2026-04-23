@@ -363,7 +363,7 @@ class WorkerManager:
                 "service": "mlx-turbo-gemma-service",
                 "accepting_requests": self._accepting_requests and not self._cooldown_active_locked(),
                 "actively_ready": actively_ready,
-                "cold_load_expected": self._cold_load_expected,
+                "cold_load_expected": self._cold_load_expected and not self._loaded,
                 "cold_load_acceptable": cold_load_acceptable,
                 "worker": {
                     "state": self._state,
