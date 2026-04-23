@@ -3,7 +3,7 @@
 A local-first inference service for running Gemma 4 on Apple Silicon with MLX, designed to act as an OpenAI-compatible lane for OpenClaw.
 It combines a lightweight HTTP supervisor with a separate worker process so local inference is easier to run, monitor, restart, and validate.
 
-Current 26B setup note: the service currently runs against the base MLX weights at [`mlx-community/gemma-4-26b-a4b-it-4bit`](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit). In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model, not to a separate published 26B TQPlus weight artifact.
+Current 26B setup note: the main service currently runs the local 8-bit candidate at `/Users/tyler/Documents/OpenClaw Assets/Models/majentik-gemma-4-26b-a4b-it-turboquant-mlx-8bit` through the original OC Dash-integrated harness on port `4017`. In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model family, not to a separate published 26B TQPlus weight artifact.
 
 ## Why this exists
 
@@ -132,7 +132,7 @@ It currently supports:
 
 - Apple Silicon Mac
 - Python 3.11+ with an MLX-capable virtualenv (see `runtime/`)
-- local Gemma model files (e.g., [mlx-community/gemma-4-26b-a4b-it-4bit](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit))
+- local Gemma model files (for the current lane, `/Users/tyler/Documents/OpenClaw Assets/Models/majentik-gemma-4-26b-a4b-it-turboquant-mlx-8bit`)
 - OpenClaw-compatible workflow if used as a lane
 
 ---
