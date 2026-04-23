@@ -1,7 +1,6 @@
-# MLX TurboQuant Service, tuned for Gemma 4 26B
+# MLX TurboQuant Service — Supervised, Local Gemma 4 26B on Apple Silicon
 
-A local-first inference service for running Gemma 4 on Apple Silicon with MLX, designed to act as an OpenAI-compatible lane for OpenClaw.
-It combines a lightweight HTTP supervisor with a separate worker process so local inference is easier to run, monitor, restart, and validate.
+Runs Gemma 4 26B-A4B locally on Apple Silicon via MLX and exposes it as an OpenAI-compatible provider boundary for OpenClaw-style agent stacks. A lightweight HTTP supervisor manages a separate worker process so the model stays up, restarts cleanly, and behaves predictably under agent workloads — single-target on purpose, not a generic multi-model surface.
 
 Current 26B setup note: the main service currently runs the 8-bit MLX weights at [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit) through the original OC Dash-integrated harness on port `4017`. In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model family, not to a separate published 26B TQPlus weight artifact.
 
