@@ -3,7 +3,7 @@
 A local-first inference service for running Gemma 4 on Apple Silicon with MLX, designed to act as an OpenAI-compatible lane for OpenClaw.
 It combines a lightweight HTTP supervisor with a separate worker process so local inference is easier to run, monitor, restart, and validate.
 
-Current 26B setup note: the main service currently runs the local 8-bit candidate at `/Users/tyler/Documents/OpenClaw Assets/Models/majentik-gemma-4-26b-a4b-it-turboquant-mlx-8bit` through the original OC Dash-integrated harness on port `4017`. In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model family, not to a separate published 26B TQPlus weight artifact.
+Current 26B setup note: the main service currently runs the 8-bit MLX weights at [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit) through the original OC Dash-integrated harness on port `4017`. In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model family, not to a separate published 26B TQPlus weight artifact.
 
 ## Why this exists
 
@@ -94,6 +94,8 @@ Configuration is split between:
 
 Typical local settings include model path, model id, Python runtime path, startup/request/probe timeouts, lazy-load behavior, idle-unload behavior, and sampling (temperature, top-p).
 
+Note: `model.maxOutputTokens` defaults to **8192** (raised from the previous 1024) so longer agent turns and tool-call sequences fit without per-request overrides. Lower it in `config/local.json` if you need to cap output for memory or latency reasons.
+
 ## Helper Scripts
 
 - `scripts/start` / `scripts/stop` / `scripts/restart`
@@ -132,7 +134,7 @@ It currently supports:
 
 - Apple Silicon Mac
 - Python 3.11+ with an MLX-capable virtualenv (see `runtime/`)
-- local Gemma model files (for the current lane, `/Users/tyler/Documents/OpenClaw Assets/Models/majentik-gemma-4-26b-a4b-it-turboquant-mlx-8bit`)
+- local Gemma model files (e.g., [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit); set `model.path` in `config/default.json` or a local override)
 - OpenClaw-compatible workflow if used as a lane
 
 ---
