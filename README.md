@@ -136,6 +136,10 @@ It currently supports:
 - local Gemma model files (e.g., [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit); set `model.path` in `config/default.json` or a local override)
 - OpenClaw-compatible workflow if used as a lane
 
+## Development note
+
+Built AI-assisted, using my personal [OpenClaw](https://github.com/openclaw/openclaw) agents as my coding collaborators.
+
 ---
 
 **Copyright:** © 2026 PetoVeritas  
