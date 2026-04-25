@@ -2,8 +2,6 @@
 
 Runs Gemma 4 26B-A4B locally on Apple Silicon via MLX and exposes it as an OpenAI-compatible provider boundary for OpenClaw-style agent stacks. A lightweight HTTP supervisor manages a separate worker process so the model stays up, restarts cleanly, and behaves predictably under agent workloads — single-target on purpose, not a generic multi-model surface.
 
-**GitHub:** [`PetoVeritas/MLX-TurboQuant-Service`](https://github.com/PetoVeritas/MLX-TurboQuant-Service)
-
 Current 26B setup note: the main service currently runs the 8-bit MLX weights at [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit) on port `4017`. In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model family, not to a separate published 26B TQPlus weight artifact.
 
 Current E4B setup note: the sibling test service runs [`mlx-community/gemma-4-e4b-it-8bit`](https://huggingface.co/mlx-community/gemma-4-e4b-it-8bit) on port `4018` for small-model agent usage.

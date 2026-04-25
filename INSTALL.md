@@ -35,8 +35,8 @@ Not tracked in the repo:
 ## 1. Clone the repo
 
 ```bash
-git clone https://github.com/PetoVeritas/MLX-TurboQuant-Service.git
-cd MLX-TurboQuant-Service
+git clone <repo-url>
+cd mlx-turbo-gemma-service
 ```
 
 ## 2. Create the worker Python environment
