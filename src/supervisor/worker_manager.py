@@ -445,8 +445,18 @@ class WorkerManager:
             self._set_state("starting", accepting_requests=False, loaded=False)
             env = os.environ.copy()
             env["PYTHONPATH"] = str(self._root_dir / "src")
-            stderr_path = self._root_dir / "tmp" / "worker-stderr.log"
+            port = str(self._config.get("server", {}).get("port", "unknown"))
+            stderr_path = self._root_dir / "tmp" / f"worker-stderr-{port}.log"
             stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            # Keep the active worker stderr file bounded. This log is diagnostic
+            # only; rotate at ~5 MiB so long-lived launchd services do not grow
+            # it forever. The port suffix avoids accidental sibling collisions.
+            try:
+                if stderr_path.exists() and stderr_path.stat().st_size > 5 * 1024 * 1024:
+                    rotated_path = stderr_path.with_suffix(stderr_path.suffix + ".1")
+                    stderr_path.replace(rotated_path)
+            except OSError:
+                pass
             self._stderr_handle = stderr_path.open("a", encoding="utf-8")
             configured_python = str(self._config.get("worker", {}).get("pythonExecutable", "")).strip()
             worker_python = os.path.expanduser(configured_python) if configured_python else sys.executable

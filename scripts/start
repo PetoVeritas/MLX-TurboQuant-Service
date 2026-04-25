@@ -2,6 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=/dev/null
+source "$ROOT_DIR/scripts/launchd-utils"
+refuse_if_launchd_loaded
+
 PID_FILE="$ROOT_DIR/tmp/supervisor.pid"
 LOG_FILE="$ROOT_DIR/tmp/supervisor.log"
 

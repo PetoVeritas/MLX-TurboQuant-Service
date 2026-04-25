@@ -2,5 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=/dev/null
+source "$ROOT_DIR/scripts/launchd-utils"
+refuse_if_launchd_loaded
+
 "$ROOT_DIR/scripts/stop"
 "$ROOT_DIR/scripts/start"

@@ -2,12 +2,14 @@
 
 Runs Gemma 4 26B-A4B locally on Apple Silicon via MLX and exposes it as an OpenAI-compatible provider boundary for OpenClaw-style agent stacks. A lightweight HTTP supervisor manages a separate worker process so the model stays up, restarts cleanly, and behaves predictably under agent workloads — single-target on purpose, not a generic multi-model surface.
 
-Current 26B setup note: the main service currently runs the 8-bit MLX weights at [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit) through the original OC Dash-integrated harness on port `4017`. In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model family, not to a separate published 26B TQPlus weight artifact.
+Current 26B setup note: the main service currently runs the 8-bit MLX weights at [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit) on port `4017`. In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model family, not to a separate published 26B TQPlus weight artifact.
+
+Current E4B setup note: the sibling test service runs [`mlx-community/gemma-4-e4b-it-8bit`](https://huggingface.co/mlx-community/gemma-4-e4b-it-8bit) on port `4018` for small-model agent usage.
 
 ## Why this exists
 
 Getting a model to produce tokens is not enough for real agent use.
-This project exists to make local Gemma 4 inference operationally usable by adding:
+This project exists to make local Gemma 4 inference **with TurboQuant** operationally usable by adding:
 
 - a stable OpenAI-style chat endpoint with streaming
 - supervised worker lifecycle management
@@ -94,6 +96,17 @@ Configuration is split between:
 Typical local settings include model path, model id, Python runtime path, startup/request/probe timeouts, lazy-load behavior, idle-unload behavior, and sampling (temperature, top-p).
 
 Note: `model.maxOutputTokens` defaults to **8192** (raised from the previous 1024) so longer agent turns and tool-call sequences fit without per-request overrides. Lower it in `config/local.json` if you need to cap output for memory or latency reasons.
+
+## KV-cache recommendation
+
+For TurboQuant / KV-cache experiments, the current recommendation is asymmetric compression:
+
+- keep **K** high precision by default
+- compress **V** first if memory pressure requires it
+- avoid symmetric low-bit K/V compression as the default
+- validate any KV change with tiny factual, long-context retrieval, heavy-context retrieval, tool-call, and reclaim tests before using it for agent traffic
+
+The service does **not** currently expose stable KV tuning environment variables. Add documented knobs only when the underlying MLX cache path is wired and tested; until then, prefer known-good baseline cache behavior.
 
 ## Helper Scripts
 

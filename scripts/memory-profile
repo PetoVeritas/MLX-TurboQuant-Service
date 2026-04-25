@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BASE_URL="${MLX_GEMMA_BASE_URL:-http://127.0.0.1:4017}"
 MODEL_ID="${MLX_GEMMA_MODEL_ID:-mlx-gemma-test-local}"
 PID_FILE="$ROOT_DIR/tmp/supervisor.pid"
+# shellcheck source=/dev/null
+source "$ROOT_DIR/scripts/launchd-utils"
 
 json_get() {
   local expr="$1"
@@ -55,13 +57,15 @@ measure() {
   worker_pid="$(printf '%s' "$stats" | json_get worker.pid)"
   worker_state="$(printf '%s' "$stats" | json_get worker.state)"
   worker_loaded="$(printf '%s' "$stats" | json_get worker.loaded)"
-  supervisor_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  supervisor_pid="$(supervisor_pid_for_measurement "$PID_FILE")"
   printf '%s\tstate=%s\tloaded=%s\tsupervisor_pid=%s\tsupervisor_rss_mb=%s\tworker_pid=%s\tworker_rss_mb=%s\n' \
     "$label" "$worker_state" "$worker_loaded" "$supervisor_pid" "$(rss_mb "$supervisor_pid")" "$worker_pid" "$(rss_mb "$worker_pid")"
 }
 
 cd "$ROOT_DIR"
-./scripts/start >/dev/null
+if ! launchd_job_loaded; then
+  ./scripts/start >/dev/null
+fi
 wait_for_stats >/dev/null
 
 echo "label\tstate\tloaded\tsupervisor_pid\tsupervisor_rss_mb\tworker_pid\tworker_rss_mb"
@@ -83,4 +87,6 @@ curl -sS -X POST "$BASE_URL/admin/worker/unload" >/dev/null
 sleep 1
 measure "after_unload"
 
-./scripts/stop >/dev/null
+if ! launchd_job_loaded; then
+  ./scripts/stop >/dev/null
+fi

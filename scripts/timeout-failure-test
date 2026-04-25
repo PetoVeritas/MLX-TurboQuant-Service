@@ -104,7 +104,7 @@ assert_eq "$(json_field /tmp/mlx-timeout-body.json error.type)" "timeout" "error
 assert_eq "$(json_field /tmp/mlx-timeout-body.json error.retryable)" "true" "timeout should be retryable"
 
 curl -fsS "http://127.0.0.1:${PORT}/admin/stats" > /tmp/mlx-timeout-stats.json
-assert_eq "$(json_field /tmp/mlx-timeout-stats.json worker.state)" "failed" "worker should move to failed after timeout"
+assert_eq "$(json_field /tmp/mlx-timeout-stats.json worker.state)" "not_loaded" "recoverable timeout should unload worker and reopen lazy admission"
 assert_eq "$(json_field /tmp/mlx-timeout-stats.json worker.last_failure_kind)" "timeout" "failure kind should be timeout"
 assert_eq "$(json_field /tmp/mlx-timeout-stats.json worker.consecutive_failures)" "1" "consecutive failures should increment once"
 assert_eq "$(json_field /tmp/mlx-timeout-stats.json metrics.request_timeouts)" "1" "request_timeouts counter should increment"
