@@ -28,6 +28,8 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
   - keeps inference isolated from the control plane over a JSON-framed subprocess pipe
 - **Lifecycle controls**
   - lazy load, idle unload, explicit unload, restart, readiness, and health checks
+- **Shared memory governor**
+  - optional file-lock/state-file admission control for sibling services so smaller lanes do not casually crowd out the protected 26B lane
 - **Operational visibility**
   - structured request and state-transition logs
   - timing metrics for load, prefill, generation, and total request time
@@ -93,9 +95,22 @@ Configuration is split between:
 - `config/local.example.json` for example overrides
 - `config/local.json` for machine-specific model/runtime settings (gitignored)
 
-Typical local settings include model path, model id, Python runtime path, startup/request/probe timeouts, lazy-load behavior, idle-unload behavior, and sampling (temperature, top-p).
+Typical local settings include model path, model id, Python runtime path, startup/request/probe timeouts, lazy-load behavior, idle-unload behavior, governor behavior, and sampling (temperature, top-p).
 
 Note: `model.maxOutputTokens` defaults to **8192** (raised from the previous 1024) so longer agent turns and tool-call sequences fit without per-request overrides. Lower it in `config/local.json` if you need to cap output for memory or latency reasons.
+
+## Shared memory governor
+
+The optional governor reserves estimated loaded-worker RSS in a JSON state file under `governor.stateDir`, protected by an advisory file lock. It is designed for sibling single-model services, not dynamic routing inside one supervisor.
+
+Recommended local shape:
+
+- 26B: `governor.instanceId: "mlx-26b"`, `priority: 1`, `rssEstimateLoadedGb: 20.0`
+- E4B sibling: `governor.instanceId: "mlx-e4b"`, `priority: 2`, `rssEstimateLoadedGb: 12.0`
+- Shared ceiling: `ceilingGb: 32.0`
+- Keep `allowLowerPriorityToPreemptHigher: false` so the E4B lane cannot preempt 26B by default
+
+When a cold load would exceed the ceiling, the governor refuses admission with `governor_refused` unless a configured preemption path can safely unload lower-priority rows first. Set `governor.enabled: false` to return to independent service behavior.
 
 ## KV-cache recommendation
 
@@ -133,6 +148,7 @@ It currently supports:
 - supervised worker startup, idle unload, and recovery
 - readiness and stats inspection that stays responsive during active generation
 - cold/warm request validation and fixture-based cleanliness checks
+- optional shared memory-governor admission for 26B/E4B sibling services
 - early hardening for OpenClaw compatibility
 
 ## Security
@@ -146,7 +162,7 @@ It currently supports:
 
 - Apple Silicon Mac
 - Python 3.11+ with an MLX-capable virtualenv (see `runtime/`)
-- local Gemma model files (e.g., [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit); set `model.path` in `config/default.json` or a local override)
+- local Gemma model files (for example, the 26B service can use [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit), while a smaller sibling service can use [`mlx-community/gemma-4-e4b-it-8bit`](https://huggingface.co/mlx-community/gemma-4-e4b-it-8bit); set `model.path` in `config/default.json` or a local override)
 - OpenClaw-compatible workflow if used as a lane
 
 ## Development note

@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from shared.config import load_config
-from supervisor.worker_manager import CompletionChunk, CompletionResult, FAILURE_BACKEND, FAILURE_COOLDOWN, FAILURE_CRASH, FAILURE_PROTOCOL, FAILURE_STARTUP, FAILURE_TIMEOUT, WorkerManager
+from supervisor.worker_manager import CompletionChunk, CompletionResult, FAILURE_BACKEND, FAILURE_COOLDOWN, FAILURE_CRASH, FAILURE_GOVERNOR, FAILURE_PROTOCOL, FAILURE_STARTUP, FAILURE_TIMEOUT, WorkerManager
 
 
 LOG = logging.getLogger("mlx_turbo_gemma.supervisor")
@@ -47,7 +47,7 @@ def split_failure(error: str) -> tuple[str | None, str]:
     if ":" not in error:
         return None, error
     prefix, remainder = error.split(":", 1)
-    if prefix in {FAILURE_BACKEND, FAILURE_PROTOCOL, FAILURE_TIMEOUT, FAILURE_STARTUP, FAILURE_CRASH}:
+    if prefix in {FAILURE_BACKEND, FAILURE_PROTOCOL, FAILURE_TIMEOUT, FAILURE_STARTUP, FAILURE_CRASH, FAILURE_GOVERNOR}:
         return prefix, remainder
     return None, error
 

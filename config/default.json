@@ -13,6 +13,16 @@
       "topP": 0.9
     }
   },
+  "governor": {
+    "enabled": false,
+    "instanceId": "mlx-26b",
+    "priority": 1,
+    "rssEstimateLoadedGb": 20.0,
+    "stateDir": "~/Library/Application Support/MLX-TurboQuant-Governor",
+    "ceilingGb": 32.0,
+    "allowLowerPriorityToPreemptHigher": false,
+    "staleAfterSeconds": 900
+  },
   "worker": {
     "startupTimeoutMs": 120000,
     "requestTimeoutMs": 180000,

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shared.governor import GovernorAdmissionError, MemoryGovernor
+
 
 LOG = logging.getLogger("mlx_turbo_gemma.supervisor.worker_manager")
 
@@ -27,6 +29,7 @@ FAILURE_BACKEND = "backend_error"
 FAILURE_UNLOAD = "unload_failure"
 FAILURE_CONFIG = "invalid_config"
 FAILURE_COOLDOWN = "cooldown_active"
+FAILURE_GOVERNOR = "governor_refused"
 
 
 @dataclass
@@ -100,6 +103,8 @@ class WorkerManager:
         self._last_activity_at = time.time()
         self._shutdown_event = threading.Event()
         self._idle_thread: threading.Thread | None = None
+        self._governor = MemoryGovernor(config)
+        self._governor_admitted = False
         self._validate_initial_state()
         self._start_idle_thread()
 
@@ -253,10 +258,21 @@ class WorkerManager:
                 pass
             self._stderr_handle = None
 
+    def _release_governor_reservation(self) -> None:
+        if not self._governor_admitted:
+            return
+        try:
+            self._governor.release()
+        except Exception as exc:
+            LOG.warning("governor_release_failed %s", exc)
+        finally:
+            self._governor_admitted = False
+
     def _reset_to_not_loaded(self) -> None:
         self._process = None
         self._stdout_queue = None
         self._close_stderr_handle()
+        self._release_governor_reservation()
         self._set_not_loaded_state(error=None)
 
     def _mark_failed(self, error: str, *, failure_kind: str = FAILURE_BACKEND) -> None:
@@ -308,6 +324,7 @@ class WorkerManager:
             self._process = None
             self._stdout_queue = None
             self._close_stderr_handle()
+            self._release_governor_reservation()
             self._record_failure_locked(
                 FAILURE_CRASH,
                 f"Worker exited unexpectedly with code {code}",
@@ -413,6 +430,14 @@ class WorkerManager:
                     "idle_unload_enabled": self._idle_unload_enabled,
                     "idle_unload_s": self._idle_unload_seconds,
                 },
+                "governor": {
+                    "enabled": self._governor.enabled,
+                    "instance_id": self._governor.instance_id,
+                    "priority": self._governor.priority,
+                    "rss_estimate_loaded_gb": self._governor.rss_estimate_gb,
+                    "ceiling_gb": self._governor.ceiling_gb,
+                    "admitted": self._governor_admitted,
+                },
             }
 
     def begin_request(self) -> tuple[bool, str | None]:
@@ -443,6 +468,20 @@ class WorkerManager:
             if self._process and self._process.poll() is None:
                 return
             self._set_state("starting", accepting_requests=False, loaded=False)
+        try:
+            self._governor.admit(pid=os.getpid())
+            self._governor_admitted = self._governor.enabled
+        except GovernorAdmissionError as exc:
+            with self._state_lock:
+                self._last_failure_kind = FAILURE_GOVERNOR
+                error_text = str(exc)
+                self._set_not_loaded_state(error=error_text)
+            if error_text.startswith(f"{FAILURE_GOVERNOR}:"):
+                raise RuntimeError(error_text) from exc
+            raise RuntimeError(f"{FAILURE_GOVERNOR}:{error_text}") from exc
+        with self._state_lock:
+            if self._process and self._process.poll() is None:
+                return
             env = os.environ.copy()
             env["PYTHONPATH"] = str(self._root_dir / "src")
             port = str(self._config.get("server", {}).get("port", "unknown"))
@@ -467,14 +506,19 @@ class WorkerManager:
             # bypasses TextIOWrapper entirely on both ends, keeping the JSON+
             # newline framing intact. See _send / _read_message and
             # worker/main.py for the matching binary access pattern.
-            self._process = subprocess.Popen(
-                [worker_python, "-m", "worker.main"],
-                cwd=str(self._root_dir),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=self._stderr_handle,
-                env=env,
-            )
+            try:
+                self._process = subprocess.Popen(
+                    [worker_python, "-m", "worker.main"],
+                    cwd=str(self._root_dir),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=self._stderr_handle,
+                    env=env,
+                )
+            except Exception:
+                self._close_stderr_handle()
+                self._release_governor_reservation()
+                raise
             # Dedicated daemon thread drains worker stdout into a queue so
             # _read_message never has to select() on a BufferedReader. select()
             # only watches the underlying fd, so when readline() over-reads
@@ -604,6 +648,7 @@ class WorkerManager:
             self._stdout_queue = None
             self._loaded = False
             self._close_stderr_handle()
+            self._release_governor_reservation()
             LOG.info("worker_terminated %s", json.dumps({"pid": prior_pid, "force": force}, sort_keys=True))
 
     def _preempt_worker_for_admin(self) -> None:
