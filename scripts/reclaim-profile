@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BASE_URL="${MLX_GEMMA_BASE_URL:-http://127.0.0.1:4017}"
 OUT_DIR="${MLX_GEMMA_RUN_OUTPUT_DIR:-$ROOT_DIR/tmp/reclaim-runs}"
-FIXTURE_PATH="${1:-$ROOT_DIR/benchmarks/heavy-context-retrieval.fixture.json}"
+FIXTURE_PATH="${1:-$ROOT_DIR/benchmarks/long-context-retrieval.fixture.json}"
 POST_RUN_WAITS_CSV="${MLX_GEMMA_RECLAIM_POST_RUN_WAITS_CSV:-10,30}"
 POST_UNLOAD_WAITS_CSV="${MLX_GEMMA_RECLAIM_POST_UNLOAD_WAITS_CSV:-0,5}"
 PID_FILE="$ROOT_DIR/tmp/supervisor.pid"

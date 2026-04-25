@@ -13,6 +13,7 @@ These fixtures are for repeatable MLX vs Ollama comparison work.
 - Do not silently rewrite the prompt between lanes
 - Capture latency, correctness, and output cleanliness together
 - Treat extra chatter, repeated bullets, leaked reasoning/wrapper text, or JSON-shape violations as output-quality problems even when the facts are correct
+- Keep the public fixtures lightweight and readable. Heavy/private stress prompts should live outside the public repo unless they are intentionally cleaned up and curated for release.
 
 ## Helper scripts
 - `../scripts/list-fixtures` — show the available fixture ids and descriptions

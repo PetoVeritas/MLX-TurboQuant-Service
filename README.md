@@ -119,7 +119,7 @@ For TurboQuant / KV-cache experiments, the current recommendation is asymmetric 
 - keep **K** high precision by default
 - compress **V** first if memory pressure requires it
 - avoid symmetric low-bit K/V compression as the default
-- validate any KV change with tiny factual, long-context retrieval, heavy-context retrieval, tool-call, and reclaim tests before using it for agent traffic
+- validate any KV change with tiny factual, long-context retrieval, tool-call, and reclaim tests before using it for agent traffic. Keep heavier private stress fixtures outside the public repo unless they are intentionally curated for release
 
 The service does **not** currently expose stable KV tuning environment variables. Add documented knobs only when the underlying MLX cache path is wired and tested; until then, prefer known-good baseline cache behavior.
 

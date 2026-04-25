@@ -11,7 +11,7 @@ It is not a one-click app. A new machine needs four things:
 ## Requirements
 
 - **Apple Silicon Mac.** Intel Macs are not supported.
-- **32GB unified memory or more.** The default 26B 4-bit model needs roughly 15GB for weights, plus headroom for KV cache and the rest of macOS. 16GB Macs will OOM during model load; 32GB is the practical floor, 64GB is comfortable.
+- **Unified memory depends on the model.** 16GB can work for smaller 2B/4B-class MLX models. The default single 26B service is tight on 32GB but workable with headroom management. Running both the 26B service and an E4B sibling service at the same time should be treated as a 48GB+ setup.
 - **Python 3.14.** Tested on 3.14.4. Minimum supported is 3.11, but recent 3.13 / 3.14 patch versions are what's actively tested. If you don't already have 3.14, install it via Homebrew: `brew install python@3.14`.
 - **~20GB of free disk space** for the default model. More if you plan to try other variants.
 - **HuggingFace CLI** for the model download step: `pip install "huggingface_hub[cli]"`.
