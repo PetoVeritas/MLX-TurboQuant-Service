@@ -26,6 +26,8 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
   - strips model-internal reasoning markers so only the final answer reaches clients
 - **Supervisor + worker design**
   - keeps inference isolated from the control plane over a JSON-framed subprocess pipe
+- **Bounded request queue**
+  - allows one active worker request plus a small configurable FIFO queue instead of dropping the first overlap as `worker_busy`
 - **Lifecycle controls**
   - lazy load, idle unload, explicit unload, restart, readiness, and health checks
 - **Shared memory governor**
@@ -98,6 +100,17 @@ Configuration is split between:
 Typical local settings include model path, model id, Python runtime path, startup/request/probe timeouts, lazy-load behavior, idle-unload behavior, governor behavior, and sampling (temperature, top-p).
 
 Note: `model.maxOutputTokens` defaults to **8192** (raised from the previous 1024) so longer agent turns and tool-call sequences fit without per-request overrides. Lower it in `config/local.json` if you need to cap output for memory or latency reasons.
+
+## Request Queue
+
+The supervisor intentionally keeps inference single-worker and local-first. It can now absorb a bounded amount of overlap with `worker.queue.maxDepth`:
+
+- `0`: no queue; overlapping requests are rejected as `worker_busy`.
+- `1`: one active request plus one queued request. This is the recommended local default for the 26B, E4B, and voice-helper lanes.
+
+Queued requests wait for the active request to finish, then run through the same worker path. If the queue is already full, `POST /v1/chat/completions` returns `409 queue_full` with the current queue depth. Queue depth, max depth, and queue metrics are visible in `/admin/stats`.
+
+This is not continuous batching. It is a conservative FIFO guard for agent traffic so short overlaps do not fail immediately while the service remains predictable. Continuous batching is a separate future scheduler change.
 
 ## Shared memory governor
 
@@ -173,4 +186,3 @@ Built AI-assisted, using my personal [OpenClaw](https://github.com/openclaw/open
 
 **Copyright:** © 2026 PetoVeritas  
 **License:** Apache-2.0
-

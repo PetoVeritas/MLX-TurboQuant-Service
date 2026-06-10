@@ -65,6 +65,8 @@ class WorkerManager:
         self._metrics = {
             "successful_requests": 0,
             "failed_requests": 0,
+            "queued_requests": 0,
+            "queue_full_rejections": 0,
             "worker_starts": 0,
             "worker_restarts": 0,
             "worker_unloads": 0,
@@ -77,6 +79,8 @@ class WorkerManager:
         }
         self._loaded = False
         self._accepting_requests = False
+        self._queued_requests = 0
+        self._request_context = threading.local()
         self._cold_load_expected = False
         self._state = "not_loaded"
         self._last_error: str | None = None
@@ -94,6 +98,8 @@ class WorkerManager:
         self._worker_start_timeout = max(1, int(self._config.get("worker", {}).get("startupTimeoutMs", 120000)) // 1000)
         self._worker_request_timeout = max(1, int(self._config.get("worker", {}).get("requestTimeoutMs", 180000)) // 1000)
         self._worker_probe_timeout = max(1, int(self._config.get("worker", {}).get("probeTimeoutMs", 1000) or 1000) // 1000)
+        queue_cfg = self._config.get("worker", {}).get("queue", {})
+        self._queue_max_depth = max(0, int(queue_cfg.get("maxDepth", 0) or 0))
         recycle_cfg = self._config.get("worker", {}).get("recycle", {})
         self._max_consecutive_errors = max(1, int(recycle_cfg.get("maxConsecutiveErrors", 3) or 3))
         self._cooldown_seconds = max(1, int(recycle_cfg.get("cooldownMs", 15000) or 15000) // 1000)
@@ -357,15 +363,21 @@ class WorkerManager:
     def can_accept_requests(self) -> bool:
         with self._state_lock:
             self._ensure_process_state()
-            return self._accepting_requests and not self._cooldown_active_locked()
+            if self._cooldown_active_locked():
+                return False
+            if self._state in {"busy", "starting"} and self._queue_max_depth > 0:
+                return self._queued_requests < self._queue_max_depth
+            return self._accepting_requests
 
     def rejection_reason(self) -> str | None:
         with self._state_lock:
             self._ensure_process_state()
             if self._cooldown_active_locked():
                 return FAILURE_COOLDOWN
-            if self._state == "busy":
-                return "worker_busy"
+            if self._state in {"busy", "starting"}:
+                if self._queue_max_depth <= 0:
+                    return "worker_busy"
+                return None if self._queued_requests < self._queue_max_depth else "queue_full"
             if not self._accepting_requests:
                 return "worker_not_ready"
             return None
@@ -395,6 +407,8 @@ class WorkerManager:
                     "idle_unload_enabled": self._idle_unload_enabled,
                     "idle_unload_threshold_s": self._idle_unload_seconds,
                     "idle_seconds": self._idle_seconds_locked(),
+                    "queue_depth": self._queued_requests,
+                    "queue_max_depth": self._queue_max_depth,
                 },
             }
 
@@ -418,6 +432,8 @@ class WorkerManager:
                     "cooldown_remaining_s": self._cooldown_remaining_seconds_locked(),
                     "consecutive_failures": self._consecutive_failures,
                     "stub_mode": bool(self._config.get("worker", {}).get("stubMode", False)),
+                    "queue_depth": self._queued_requests,
+                    "queue_max_depth": self._queue_max_depth,
                 },
                 "metrics": dict(self._metrics),
                 "config": {
@@ -427,6 +443,7 @@ class WorkerManager:
                     "lazy_load": bool(self._config.get("worker", {}).get("lazyLoad", True)),
                     "cooldown_s": self._cooldown_seconds,
                     "max_consecutive_errors": self._max_consecutive_errors,
+                    "queue_max_depth": self._queue_max_depth,
                     "idle_unload_enabled": self._idle_unload_enabled,
                     "idle_unload_s": self._idle_unload_seconds,
                 },
@@ -442,13 +459,33 @@ class WorkerManager:
 
     def begin_request(self) -> tuple[bool, str | None]:
         with self._state_lock:
+            self._request_context.queued = False
             self._ensure_process_state()
             if self._cooldown_active_locked():
                 return False, FAILURE_COOLDOWN
+            if self._state in {"busy", "starting"}:
+                if self._queue_max_depth <= 0:
+                    return False, "worker_busy"
+                if self._queued_requests >= self._queue_max_depth:
+                    self._metrics["queue_full_rejections"] += 1
+                    return False, "queue_full"
+                self._queued_requests += 1
+                self._metrics["queued_requests"] += 1
+                self._request_context.queued = True
+                LOG.info(
+                    "worker_request_queued %s",
+                    json.dumps(
+                        {
+                            "queue_depth": self._queued_requests,
+                            "queue_max_depth": self._queue_max_depth,
+                            "state": self._state,
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                return True, "queued"
             if not self._accepting_requests:
                 return False, "worker_not_ready"
-            if self._state == "busy":
-                return False, "worker_busy"
             if not self._loaded and self._cold_load_expected:
                 self._set_state("starting", accepting_requests=False)
             else:
@@ -779,10 +816,17 @@ class WorkerManager:
 
     def complete_request(self, success: bool, error: str | None = None, failure_kind: str | None = None) -> None:
         with self._state_lock:
+            was_queued = bool(getattr(self._request_context, "queued", False))
+            if was_queued:
+                self._queued_requests = max(0, self._queued_requests - 1)
+                self._request_context.queued = False
             if success:
                 self._metrics["successful_requests"] += 1
                 self._record_success_locked()
-                self._set_state("ready", accepting_requests=True, loaded=True, error=None)
+                if self._queued_requests > 0:
+                    self._set_state("busy", accepting_requests=False, loaded=True, error=None)
+                else:
+                    self._set_state("ready", accepting_requests=True, loaded=True, error=None)
             else:
                 self._metrics["failed_requests"] += 1
                 resolved_kind = failure_kind or self._last_failure_kind or FAILURE_BACKEND

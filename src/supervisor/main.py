@@ -250,6 +250,12 @@ def make_handler(app: App):
             if not accepted:
                 if reason == "worker_busy":
                     self._error(409, "worker_busy", "Worker is busy and queue depth is zero", retryable=True)
+                elif reason == "queue_full":
+                    stats = app.worker.stats_payload()
+                    worker = stats.get("worker", {})
+                    depth = worker.get("queue_depth", 0)
+                    max_depth = worker.get("queue_max_depth", 0)
+                    self._error(409, "queue_full", f"Worker queue is full ({depth}/{max_depth})", retryable=True)
                 elif reason == FAILURE_COOLDOWN:
                     stats = app.worker.stats_payload()
                     remaining = stats["worker"].get("cooldown_remaining_s", 0)
@@ -451,6 +457,12 @@ def validate_chat_request(payload: dict[str, Any], app: App) -> tuple[int, str, 
         reason = app.worker.rejection_reason()
         if reason == "worker_busy":
             return 409, "worker_busy", "Worker is busy and queue depth is zero"
+        if reason == "queue_full":
+            stats = app.worker.stats_payload()
+            worker = stats.get("worker", {})
+            depth = worker.get("queue_depth", 0)
+            max_depth = worker.get("queue_max_depth", 0)
+            return 409, "queue_full", f"Worker queue is full ({depth}/{max_depth})"
         if reason == FAILURE_COOLDOWN:
             stats = app.worker.stats_payload()
             remaining = stats["worker"].get("cooldown_remaining_s", 0)
