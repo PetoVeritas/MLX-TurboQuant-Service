@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from shared.governor import GovernorAdmissionError, MemoryGovernor
+from shared.parts import modalities_status
 
 
 LOG = logging.getLogger("mlx_turbo_gemma.supervisor.worker_manager")
@@ -410,12 +411,13 @@ class WorkerManager:
                     "queue_depth": self._queued_requests,
                     "queue_max_depth": self._queue_max_depth,
                 },
+                "modalities": modalities_status(self._config),
             }
 
     def models_payload(self) -> dict[str, Any]:
         return {
             "object": "list",
-            "data": [{"id": self.model_id, "object": "model", "owned_by": "local"}],
+            "data": [{"id": self.model_id, "object": "model", "owned_by": "local", "modalities": modalities_status(self._config)}],
         }
 
     def stats_payload(self) -> dict[str, Any]:
@@ -455,6 +457,7 @@ class WorkerManager:
                     "ceiling_gb": self._governor.ceiling_gb,
                     "admitted": self._governor_admitted,
                 },
+                "modalities": modalities_status(self._config),
             }
 
     def begin_request(self) -> tuple[bool, str | None]:
@@ -837,9 +840,28 @@ class WorkerManager:
                     return
                 self._record_failure_locked(resolved_kind, resolved_error, loaded=self._loaded)
 
+    def complete_request_rejected(self, error: str) -> None:
+        """Release a request rejected by capability/policy without degrading worker health."""
+
+        with self._state_lock:
+            was_queued = bool(getattr(self._request_context, "queued", False))
+            if was_queued:
+                self._queued_requests = max(0, self._queued_requests - 1)
+                self._request_context.queued = False
+            self._metrics["failed_requests"] += 1
+            self._last_error = error
+            self._last_activity_at = time.time()
+            if self._loaded:
+                if self._queued_requests > 0:
+                    self._set_state("busy", accepting_requests=False, loaded=True, error=error)
+                else:
+                    self._set_state("ready", accepting_requests=True, loaded=True, error=error)
+            else:
+                self._set_not_loaded_state(error=error)
+
     def _begin_worker_request_locked(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         max_tokens: int | None,
         tools: list[dict[str, Any]] | None,
         *,
@@ -885,7 +907,7 @@ class WorkerManager:
         )
         return request_id
 
-    def generate_completion(self, messages: list[dict[str, str]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> CompletionResult:
+    def generate_completion(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> CompletionResult:
         # Acquire _worker_lock (serializes against other generations, admin
         # unload/restart, and idle-unload) but NOT _state_lock across the full
         # request. Readers like /ready, /admin/stats, /v1/models only need
@@ -906,7 +928,10 @@ class WorkerManager:
                 raise RuntimeError(f"{FAILURE_CRASH}:Worker request crashed:{exc}") from exc
 
         if message.get("type") == "error":
-            raise RuntimeError(f"{FAILURE_BACKEND}:{str(message.get('error', 'worker_error'))}")
+            error = str(message.get("error", "worker_error"))
+            if error.startswith("unsupported_modality:"):
+                raise RuntimeError(error)
+            raise RuntimeError(f"{FAILURE_BACKEND}:{error}")
         if message.get("type") != "completion_result":
             raise RuntimeError(f"{FAILURE_PROTOCOL}:Unexpected worker response: {message}")
 
@@ -934,7 +959,7 @@ class WorkerManager:
             tool_calls=message.get("tool_calls"),
         )
 
-    def generate_completion_stream(self, messages: list[dict[str, str]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None):
+    def generate_completion_stream(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None):
         # Note: _worker_lock is held across the full generation (including
         # yields) so concurrent worker I/O is serialized, but _state_lock is
         # released between each read, so readers stay responsive.
@@ -947,7 +972,10 @@ class WorkerManager:
                         yield CompletionChunk(content=str(message.get("content", "")))
                         continue
                     if message.get("type") == "error":
-                        raise RuntimeError(f"{FAILURE_BACKEND}:{str(message.get('error', 'worker_error'))}")
+                        error = str(message.get("error", "worker_error"))
+                        if error.startswith("unsupported_modality:"):
+                            raise RuntimeError(error)
+                        raise RuntimeError(f"{FAILURE_BACKEND}:{error}")
                     if message.get("type") != "completion_result":
                         raise RuntimeError(f"{FAILURE_PROTOCOL}:Unexpected worker response: {message}")
 

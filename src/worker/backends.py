@@ -424,6 +424,9 @@ def _decode_assistant_tool_call_arguments(messages: list[dict[str, Any]]) -> lis
 class WorkerBackend:
     name = "base"
 
+    def supported_modalities(self) -> set[str]:
+        return {"text"}
+
     def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
         raise NotImplementedError
 

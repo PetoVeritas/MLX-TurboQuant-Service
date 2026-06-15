@@ -13,6 +13,50 @@
       "topP": 0.9
     }
   },
+  "modalities": {
+    "text": {
+      "enabled": true
+    },
+    "image": {
+      "enabled": false,
+      "maxInputs": 4,
+      "maxBytesMb": 20,
+      "allowedMimeTypes": ["image/png", "image/jpeg", "image/webp"],
+      "transport": ["data_url"]
+    },
+    "video": {
+      "enabled": false,
+      "maxInputs": 1,
+      "maxBytesMb": 200,
+      "allowedMimeTypes": ["video/mp4", "video/quicktime"],
+      "transport": ["data_url"],
+      "framePolicy": {
+        "mode": "sample",
+        "maxFrames": 16,
+        "fps": 1
+      }
+    },
+    "audio": {
+      "enabled": false,
+      "maxInputs": 2,
+      "maxBytesMb": 50,
+      "allowedMimeTypes": ["audio/wav", "audio/mpeg", "audio/mp4", "audio/x-m4a"],
+      "transport": ["data_url"],
+      "transcode": {
+        "enabled": false,
+        "targetFormat": "wav",
+        "sampleRateHz": 16000
+      }
+    },
+    "document": {
+      "enabled": false,
+      "maxInputs": 2,
+      "maxBytesMb": 20,
+      "allowedMimeTypes": ["application/pdf", "text/plain", "text/markdown"],
+      "transport": ["data_url"]
+    },
+    "strictCapabilityCheck": true
+  },
   "governor": {
     "enabled": false,
     "instanceId": "mlx-26b",

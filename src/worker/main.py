@@ -7,6 +7,7 @@ import os
 import sys
 from typing import Any
 
+from shared.parts import unsupported_backend_modalities
 from worker.backends import BackendResult, BackendStreamChunk, build_backend
 from worker.config import load_config
 
@@ -16,6 +17,14 @@ def emit(payload: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
+def ensure_backend_supports_messages(backend: Any, messages: list[dict[str, Any]]) -> None:
+    supported = backend.supported_modalities() if hasattr(backend, "supported_modalities") else {"text"}
+    unsupported = unsupported_backend_modalities(messages, set(supported))
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise RuntimeError(f"unsupported_modality:Backend does not support requested modality: {names}")
+
+
 def handle_generate(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
     request_id = payload.get("request_id", "unknown")
     messages = payload.get("messages", [])
@@ -23,6 +32,7 @@ def handle_generate(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
     tools = payload.get("tools")
 
     try:
+        ensure_backend_supports_messages(backend, messages)
         result = backend.generate(messages, max_tokens, tools=tools)
     except RuntimeError as exc:
         return {"type": "error", "request_id": request_id, "error": str(exc)}
@@ -45,6 +55,7 @@ def handle_generate_stream(backend: Any, payload: dict[str, Any]) -> None:
     tools = payload.get("tools")
 
     try:
+        ensure_backend_supports_messages(backend, messages)
         for event in backend.stream_generate(messages, max_tokens, tools=tools):
             if isinstance(event, BackendStreamChunk):
                 emit({"type": "completion_chunk", "request_id": request_id, "content": event.text})

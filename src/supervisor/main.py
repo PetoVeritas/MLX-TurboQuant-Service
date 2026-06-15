@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from shared.config import load_config
+from shared.parts import MessagePartError, extract_message_parts, part_modalities, parts_to_dicts, text_from_parts, validate_part_counts
 from supervisor.worker_manager import CompletionChunk, CompletionResult, FAILURE_BACKEND, FAILURE_COOLDOWN, FAILURE_CRASH, FAILURE_GOVERNOR, FAILURE_PROTOCOL, FAILURE_STARTUP, FAILURE_TIMEOUT, WorkerManager
 
 
@@ -47,7 +48,7 @@ def split_failure(error: str) -> tuple[str | None, str]:
     if ":" not in error:
         return None, error
     prefix, remainder = error.split(":", 1)
-    if prefix in {FAILURE_BACKEND, FAILURE_PROTOCOL, FAILURE_TIMEOUT, FAILURE_STARTUP, FAILURE_CRASH, FAILURE_GOVERNOR}:
+    if prefix in {FAILURE_BACKEND, FAILURE_PROTOCOL, FAILURE_TIMEOUT, FAILURE_STARTUP, FAILURE_CRASH, FAILURE_GOVERNOR, "unsupported_modality"}:
         return prefix, remainder
     return None, error
 
@@ -269,7 +270,7 @@ def make_handler(app: App):
                 max_tokens = payload.get("max_tokens")
                 if max_tokens is None:
                     max_tokens = payload.get("max_completion_tokens")
-                normalized_messages = normalize_messages(payload["messages"])
+                normalized_messages = normalize_messages(payload["messages"], config=app.config)
                 tools = payload.get("tools") if isinstance(payload.get("tools"), list) else None
                 if payload.get("stream") is True:
                     stream_options = payload.get("stream_options")
@@ -348,12 +349,17 @@ def make_handler(app: App):
                     "http_completion_failed %s",
                     json.dumps({"model": payload["model"], "error": clean_error, "failure_kind": failure_kind}, sort_keys=True),
                 )
-                app.worker.complete_request(success=False, error=clean_error, failure_kind=failure_kind)
-                if failure_kind == FAILURE_PROTOCOL:
+                if failure_kind == "unsupported_modality":
+                    app.worker.complete_request_rejected(clean_error)
+                    self._error(422, "unsupported_modality", clean_error, retryable=False)
+                elif failure_kind == FAILURE_PROTOCOL:
+                    app.worker.complete_request(success=False, error=clean_error, failure_kind=failure_kind)
                     self._error(503, "worker_failed", clean_error, retryable=True)
                 elif failure_kind == FAILURE_BACKEND:
+                    app.worker.complete_request(success=False, error=clean_error, failure_kind=failure_kind)
                     self._error(503, "worker_failed", clean_error, retryable=True)
                 else:
+                    app.worker.complete_request(success=False, error=clean_error, failure_kind=failure_kind)
                     self._error(503, "worker_failed", raw_error, retryable=True)
             except Exception as exc:  # pragma: no cover
                 LOG.exception("Unexpected supervisor error during completion")
@@ -363,29 +369,16 @@ def make_handler(app: App):
     return Handler
 
 
-def extract_message_text(content: Any, *, allow_non_text: bool = False) -> str | None:
-    if content is None:
-        return "" if allow_non_text else None
-    if isinstance(content, str):
-        return content
-    if isinstance(content, dict):
-        content = [content]
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                return None
-            item_type = item.get("type")
-            if item_type in {"text", "input_text", "output_text"} and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-            elif item_type in {"thinking", "reasoning"}:
-                continue
-            elif allow_non_text and item_type in {"toolCall", "tool_call", "function_call", "tool_use"}:
-                continue
-            else:
-                return None
-        return "\n".join(part for part in parts if part)
-    return None
+def extract_message_text(content: Any, *, allow_non_text: bool = False, config: dict[str, Any] | None = None) -> str | None:
+    parts = extract_message_parts(
+        content,
+        config=config,
+        allow_empty=allow_non_text,
+        allow_tool_content=allow_non_text,
+    )
+    if parts is None:
+        return None
+    return text_from_parts(parts)
 
 
 def _role_allows_null_content(role: str) -> bool:
@@ -395,13 +388,21 @@ def _role_allows_null_content(role: str) -> bool:
     return role in {"assistant", "tool"}
 
 
-def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def normalize_messages(messages: list[dict[str, Any]], config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for message in messages:
         role = str(message["role"])
         allow_non_text = _role_allows_null_content(role)
-        text = extract_message_text(message.get("content"), allow_non_text=allow_non_text)
+        parts = extract_message_parts(
+            message.get("content"),
+            config=config,
+            allow_empty=allow_non_text,
+            allow_tool_content=allow_non_text,
+        )
+        text = text_from_parts(parts or [])
         normalized_message: dict[str, Any] = {"role": role, "content": text or ""}
+        if parts and any(part.type != "text" for part in parts):
+            normalized_message["parts"] = parts_to_dicts(parts)
         if role == "assistant" and isinstance(message.get("tool_calls"), list):
             normalized_message["tool_calls"] = message["tool_calls"]
         if role == "tool":
@@ -416,6 +417,7 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def validate_chat_request(payload: dict[str, Any], app: App) -> tuple[int, str, str] | None:
+    config = getattr(app, "config", getattr(app.worker, "_config", {}))
     unknown_fields = set(payload) - ALLOWED_CHAT_FIELDS
     if unknown_fields:
         return 400, "unsupported_request", f"Unsupported top-level fields: {', '.join(sorted(unknown_fields))}"
@@ -427,14 +429,32 @@ def validate_chat_request(payload: dict[str, Any], app: App) -> tuple[int, str, 
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return 400, "bad_request", "Field 'messages' must be a non-empty array"
+    part_counts: dict[str, int] = {}
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             return 400, "bad_request", f"Message at index {index} must be an object"
         role = message.get("role")
         if role not in ALLOWED_ROLES:
             return 400, "unsupported_request", f"Unsupported role at index {index}: {role!r}"
-        if extract_message_text(message.get("content"), allow_non_text=_role_allows_null_content(role)) is None:
-            return 400, "unsupported_request", f"Message content at index {index} must be text or text parts"
+        try:
+            parts = extract_message_parts(
+                message.get("content"),
+                config=config,
+                allow_empty=_role_allows_null_content(role),
+                allow_tool_content=_role_allows_null_content(role),
+            )
+        except MessagePartError as exc:
+            status = 422 if exc.error_type == "unsupported_modality" else 400
+            return status, exc.error_type, exc.message
+        if parts is None:
+            return 400, "unsupported_request", f"Message content at index {index} must contain supported typed parts"
+        for modality in part_modalities(parts):
+            if modality != "text":
+                part_counts[modality] = part_counts.get(modality, 0) + sum(1 for part in parts if part.type == modality)
+    try:
+        validate_part_counts(part_counts, config)
+    except MessagePartError as exc:
+        return 400, exc.error_type, exc.message
     if "stream" in payload:
         stream = payload["stream"]
         if not isinstance(stream, bool):
