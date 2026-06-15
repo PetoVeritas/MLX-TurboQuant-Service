@@ -202,6 +202,93 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertEqual(result.usage, {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5})
         self.assertEqual(result.finish_reason, "stop")
 
+    def test_vlm_turboquant_passes_tools_to_chat_template_and_decodes_prior_tool_args(self):
+        backend = MlxVlmTurboQuantBackend.__new__(MlxVlmTurboQuantBackend)
+        captured: dict[str, Any] = {}
+
+        class FakeTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                captured["messages"] = messages
+                captured["tools"] = kwargs.get("tools")
+                captured["tokenize"] = kwargs.get("tokenize")
+                captured["add_generation_prompt"] = kwargs.get("add_generation_prompt")
+                return "templated prompt"
+
+        backend._processor = type("Processor", (), {"tokenizer": FakeTokenizer()})()
+        tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}]
+        messages = [
+            {"role": "user", "content": "lookup dc"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"city\":\"dc\"}"},
+                    }
+                ],
+            },
+        ]
+
+        prompt = backend._build_prompt(messages, tools=tools)
+
+        self.assertEqual(prompt, "templated prompt")
+        self.assertIs(captured["tools"], tools)
+        self.assertFalse(captured["tokenize"])
+        self.assertTrue(captured["add_generation_prompt"])
+        self.assertEqual(captured["messages"][1]["tool_calls"][0]["function"]["arguments"], {"city": "dc"})
+
+    def test_vlm_turboquant_returns_openai_tool_calls_from_gemma_call_output(self):
+        backend = MlxVlmTurboQuantBackend.__new__(MlxVlmTurboQuantBackend)
+        backend._model = object()
+        backend._processor = object()
+        backend._max_output_tokens = 32
+        backend._sampling_kwargs = {}
+        backend._load_ms = 0
+        backend._load_consumed = False
+        backend._generate = lambda *args, **kwargs: 'call:lookup{city:<|"|>dc<|"|>}'
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look something up",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+
+        result = backend.generate([{"role": "user", "content": "lookup dc"}], max_tokens=12, tools=tools)
+
+        self.assertEqual(result.finish_reason, "tool_calls")
+        self.assertEqual(result.content, "")
+        self.assertIsNotNone(result.tool_calls)
+        self.assertEqual(result.tool_calls[0]["type"], "function")
+        self.assertEqual(result.tool_calls[0]["function"]["name"], "lookup")
+        self.assertEqual(json.loads(result.tool_calls[0]["function"]["arguments"]), {"city": "dc"})
+
+    def test_vlm_turboquant_filters_undeclared_tool_calls(self):
+        backend = MlxVlmTurboQuantBackend.__new__(MlxVlmTurboQuantBackend)
+        backend._model = object()
+        backend._processor = object()
+        backend._max_output_tokens = 32
+        backend._sampling_kwargs = {}
+        backend._load_ms = 0
+        backend._load_consumed = False
+        backend._generate = lambda *args, **kwargs: 'call:not_allowed{city:<|"|>dc<|"|>}'
+        tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}]
+
+        result = backend.generate([{"role": "user", "content": "lookup dc"}], max_tokens=12, tools=tools)
+
+        self.assertEqual(result.finish_reason, "stop")
+        self.assertIsNone(result.tool_calls)
+        self.assertIn("not_allowed", result.content)
+
 
 if __name__ == "__main__":
     unittest.main()

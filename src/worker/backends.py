@@ -571,17 +571,18 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
             supported.add("audio")
         return supported & set(self.supported_modality_set)
 
-    def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
+    def _build_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+        template_messages = _decode_assistant_tool_call_arguments(messages) if tools else messages
         if callable(apply_chat_template):
             try:
-                return apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                return apply_chat_template(template_messages, tools=tools, tokenize=False, add_generation_prompt=True)
             except Exception:
                 pass
 
         rendered: list[str] = []
-        for message in messages:
+        for message in template_messages:
             role = str(message.get("role", "user"))
             content = str(message.get("content", ""))
             if role == "system":
@@ -629,7 +630,7 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
             kwargs["top_p"] = float(top_p)
         return kwargs
 
-    def _prepare_request(self, messages: list[dict[str, Any]]) -> VlmPreparedRequest:
+    def _prepare_request(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> VlmPreparedRequest:
         prompt_messages: list[dict[str, Any]] = []
         image_paths: list[str] = []
         audio_paths: list[str] = []
@@ -674,21 +675,18 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
             prompt_messages.append(next_message)
 
         return VlmPreparedRequest(
-            prompt=self._build_prompt(prompt_messages),
+            prompt=self._build_prompt(prompt_messages, tools=tools),
             image_paths=image_paths,
             audio_paths=audio_paths,
             temp_dir=temp_dir,
         )
 
     def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
-        if tools:
-            raise RuntimeError("mlx_vlm_tools_not_supported")
-
         effective_max_tokens = self._max_output_tokens
         if isinstance(max_tokens, int) and max_tokens > 0:
             effective_max_tokens = min(max_tokens, self._max_output_tokens)
 
-        prepared = self._prepare_request(messages)
+        prepared = self._prepare_request(messages, tools=tools)
         generation_started = time.perf_counter()
         try:
             response = self._generate(
@@ -708,6 +706,14 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
 
         raw_content = response if isinstance(response, str) else getattr(response, "text", "")
         content = strip_channel_markup(str(raw_content or "")).strip()
+        content, finish_reason, tool_calls = parse_tool_calls(content)
+        if tool_calls:
+            tool_calls, hallucinated_names = filter_hallucinated_tool_calls(tool_calls, tools)
+            if not tool_calls and hallucinated_names:
+                content = f"[tool-call error] Model attempted unavailable tool(s): {', '.join(hallucinated_names)}"
+                finish_reason = "stop"
+            elif tool_calls:
+                finish_reason = "tool_calls"
         prompt_tokens = int(getattr(response, "prompt_tokens", 0) or 0)
         completion_tokens = int(getattr(response, "generation_tokens", 0) or 0)
         if prompt_tokens <= 0:
@@ -721,7 +727,7 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
         peak_memory = getattr(response, "peak_memory", None)
         return BackendResult(
             content=content,
-            finish_reason=str(getattr(response, "finish_reason", "stop") or "stop"),
+            finish_reason=finish_reason if tool_calls else str(getattr(response, "finish_reason", finish_reason) or finish_reason),
             usage={
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -735,7 +741,7 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
                 "peak_memory_gb": float(peak_memory) if isinstance(peak_memory, (int, float)) else None,
                 "total_ms": total_ms,
             },
-            tool_calls=None,
+            tool_calls=tool_calls,
         )
 
 
