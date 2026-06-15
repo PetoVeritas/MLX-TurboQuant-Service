@@ -38,7 +38,7 @@ class CompletionResult:
     content: str
     finish_reason: str
     usage: dict[str, int]
-    metrics: dict[str, int | None]
+    metrics: dict[str, int | float | None]
     tool_calls: list[dict[str, Any]] | None = None
 
 

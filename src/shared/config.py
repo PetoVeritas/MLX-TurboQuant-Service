@@ -11,6 +11,7 @@ from typing import Any
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = ROOT_DIR / "config" / "default.json"
 LOCAL_CONFIG_PATH = ROOT_DIR / "config" / "local.json"
+EXTRA_CONFIG_ENV = "MLX_GEMMA_CONFIG"
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -66,6 +67,10 @@ def load_config() -> dict[str, Any]:
 
     if LOCAL_CONFIG_PATH.exists():
         config = deep_merge(config, load_json_file(LOCAL_CONFIG_PATH))
+
+    extra_config = os.getenv(EXTRA_CONFIG_ENV)
+    if extra_config:
+        config = deep_merge(config, load_json_file(Path(extra_config).expanduser()))
 
     config = apply_env_overrides(config)
     return config

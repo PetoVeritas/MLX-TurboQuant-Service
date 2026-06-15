@@ -1,0 +1,32 @@
+--- /Users/tyler/.openclaw/workspace/projects/gemma-mlx-service/spikes/mlx-vlm-20260615/language.py.before-phase0	2026-06-15 15:10:14
++++ /Users/tyler/.openclaw/workspace/projects/gemma-mlx-service/spikes/mlx-vlm-20260615/.venv/lib/python3.14/site-packages/mlx_vlm/models/gemma4/language.py	2026-06-15 15:10:23
+@@ -377,13 +377,12 @@
+         self.embed_scale = config.hidden_size**0.5
+         num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+         first_kv_shared = config.num_hidden_layers - num_kv_shared
++        # Elastic Gemma 4 checkpoints still carry K/V weights for layers that
++        # reuse another layer's KV cache at runtime.  Match mlx-lm's loading
++        # shape by allocating those modules for every layer, then keep the
++        # runtime sharing behavior in previous_kvs below.
+         self.layers = [
+-            DecoderLayer(
+-                config,
+-                layer_idx=i,
+-                kv_shared_only=kv_shared_only
+-                or (num_kv_shared > 0 and i >= first_kv_shared),
+-            )
++            DecoderLayer(config, layer_idx=i, kv_shared_only=kv_shared_only)
+             for i in range(config.num_hidden_layers)
+         ]
+         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+@@ -825,6 +824,10 @@
+         if not getattr(attn, "is_kv_shared_layer", False):
+             return False
+ 
++        attn = self.model.layers[layer_idx].self_attn
++        if hasattr(attn, parts[2]):
++            return False
++
+         return parts[2] in {"k_proj", "v_proj", "k_norm", "v_norm"}
+ 
+     @property

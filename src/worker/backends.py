@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
+import tempfile
 import time
 import uuid
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from shared.backend_adapters import BACKEND_ADAPTERS, backend_descriptor, configured_backend_id, turboquant_supported_modalities
 
 
 @dataclass
@@ -17,13 +22,26 @@ class BackendResult:
     content: str
     finish_reason: str
     usage: dict[str, int]
-    metrics: dict[str, int | None]
+    metrics: dict[str, int | float | None]
     tool_calls: list[dict[str, Any]] | None = None
 
 
 @dataclass
 class BackendStreamChunk:
     text: str
+
+
+@dataclass
+class VlmPreparedRequest:
+    prompt: str
+    image_paths: list[str]
+    audio_paths: list[str]
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+
+    def cleanup(self) -> None:
+        if self.temp_dir is not None:
+            self.temp_dir.cleanup()
+            self.temp_dir = None
 
 
 _TOOL_SENTINEL_RE = re.compile(r"</?\|?tool_call\|?>")
@@ -423,9 +441,15 @@ def _decode_assistant_tool_call_arguments(messages: list[dict[str, Any]]) -> lis
 
 class WorkerBackend:
     name = "base"
+    backend_id = "base"
+    supported_modality_set = frozenset({"text"})
+
+    @classmethod
+    def supported_modalities_for_config(cls, _config: dict[str, Any] | None = None) -> set[str]:
+        return set(cls.supported_modality_set)
 
     def supported_modalities(self) -> set[str]:
-        return {"text"}
+        return self.supported_modalities_for_config(getattr(self, "_config", None))
 
     def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
         raise NotImplementedError
@@ -439,6 +463,8 @@ class WorkerBackend:
 
 class StubBackend(WorkerBackend):
     name = "stub"
+    backend_id = "stub"
+    supported_modality_set = BACKEND_ADAPTERS["stub"].supported_modalities
 
     def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
         if os.getenv("MLX_GEMMA_STUB_FAIL") == "1":
@@ -491,322 +517,211 @@ class StubBackend(WorkerBackend):
         yield result
 
 
-class MlxBackend(WorkerBackend):
-    name = "mlx"
+class MlxVlmTurboQuantBackend(WorkerBackend):
+    name = "mlx_vlm_turboquant"
+    backend_id = "mlx_vlm_turboquant"
+    supported_modality_set = BACKEND_ADAPTERS["mlx_vlm_turboquant"].supported_modalities
+
+    @classmethod
+    def supported_modalities_for_config(cls, config: dict[str, Any] | None = None) -> set[str]:
+        if config is None:
+            return set(cls.supported_modality_set)
+        return turboquant_supported_modalities(config)
 
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
         raw_model_path = str(self._config.get("model", {}).get("path", "")).strip()
         self._model_path = str(Path(raw_model_path).expanduser()) if raw_model_path else ""
         if not self._model_path:
-            raise RuntimeError("mlx_model_path_not_configured")
+            raise RuntimeError("mlx_vlm_model_path_not_configured")
         if not Path(self._model_path).exists():
-            raise RuntimeError(f"mlx_model_path_missing:{self._model_path}")
+            raise RuntimeError(f"mlx_vlm_model_path_missing:{self._model_path}")
 
         try:
-            from mlx_lm import load, stream_generate  # type: ignore
+            from mlx_vlm import generate, load  # type: ignore
         except Exception as exc:  # pragma: no cover - depends on local runtime
-            raise RuntimeError(f"mlx_runtime_import_failed:{exc}") from exc
+            raise RuntimeError(f"mlx_vlm_runtime_import_failed:{exc}") from exc
 
-        self._stream_generate = stream_generate
+        self._generate = generate
         self._max_output_tokens = int(self._config.get("model", {}).get("maxOutputTokens", 1024) or 1024)
+        sampling_cfg = self._config.get("model", {}).get("sampling", {})
+        self._sampling_kwargs = self._generation_sampling_kwargs(sampling_cfg if isinstance(sampling_cfg, dict) else {})
         self._load_ms = 0
         self._load_consumed = False
 
-        # Default sampler. Greedy decoding on a tool-trained model tends to
-        # lock onto a tool-call opener for prompts that pattern-match "function
-        # call" (weather, time, search, etc.). A mild non-greedy sampler keeps
-        # ordinary prompts answering in prose. If the installed mlx_lm version
-        # doesn't expose make_sampler, fall back to greedy so we stay
-        # backward-compatible instead of hard-failing the worker.
-        sampling_cfg = self._config.get("model", {}).get("sampling") or {}
-        try:
-            temperature = float(sampling_cfg.get("temperature", 0.7))
-        except (TypeError, ValueError):
-            temperature = 0.7
-        try:
-            top_p = float(sampling_cfg.get("topP", 0.9))
-        except (TypeError, ValueError):
-            top_p = 0.9
-        self._sampler = None
-        try:
-            from mlx_lm.sample_utils import make_sampler  # type: ignore
-
-            self._sampler = make_sampler(temp=temperature, top_p=top_p)
-        except Exception:  # pragma: no cover - depends on local runtime
-            self._sampler = None
-
         load_started = time.perf_counter()
         try:
-            self._model, self._tokenizer = load(self._model_path, lazy=False)
+            self._model, self._processor = load(self._model_path, lazy=False)
         except Exception as exc:  # pragma: no cover - depends on local runtime
-            raise RuntimeError(f"mlx_model_load_failed:{exc}") from exc
+            raise RuntimeError(f"mlx_vlm_model_load_failed:{exc}") from exc
         self._load_ms = int((time.perf_counter() - load_started) * 1000)
 
-    def _build_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
-        template_kwargs: dict[str, Any] = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-            "enable_thinking": False,
+        model_type = str(getattr(getattr(self._model, "config", None), "model_type", "") or "")
+        if model_type not in {"gemma4", "gemma4_unified"}:
+            raise RuntimeError(f"mlx_vlm_unsupported_model_type:{model_type or 'unknown'}")
+
+    def supported_modalities(self) -> set[str]:
+        config = getattr(getattr(self._model, "config", None), "__dict__", None)
+        if not isinstance(config, dict):
+            return self.supported_modalities_for_config(getattr(self, "_config", None))
+        supported = {"text"}
+        if config.get("vision_config") is not None:
+            supported.add("image")
+        if config.get("audio_config") is not None:
+            supported.add("audio")
+        return supported & set(self.supported_modality_set)
+
+    def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
+        apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+        if callable(apply_chat_template):
+            try:
+                return apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                pass
+
+        rendered: list[str] = []
+        for message in messages:
+            role = str(message.get("role", "user"))
+            content = str(message.get("content", ""))
+            if role == "system":
+                rendered.append(content)
+            elif role == "assistant":
+                rendered.append(f"Assistant: {content}")
+            else:
+                rendered.append(content)
+        return "\n\n".join(part for part in rendered if part).strip()
+
+    @staticmethod
+    def _media_suffix(mime_type: str, modality: str) -> str:
+        suffixes = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mpeg": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a",
         }
-        if tools:
-            template_kwargs["tools"] = tools
-        # Gemma's chat template expects structured tool_call arguments (dicts),
-        # not OpenAI-style stringified JSON. Decode before templating so the
-        # model sees its own prior tool call correctly rendered on replay.
-        template_messages = _decode_assistant_tool_call_arguments(messages)
+        return suffixes.get(mime_type, f".{modality}")
+
+    @staticmethod
+    def _decode_data_url(data_url: str) -> bytes:
+        if not data_url.startswith("data:") or "," not in data_url:
+            raise RuntimeError("mlx_vlm_invalid_data_url")
+        header, encoded = data_url[5:].split(",", 1)
+        if "base64" not in {part.lower() for part in header.split(";")[1:]}:
+            raise RuntimeError("mlx_vlm_data_url_must_be_base64")
         try:
-            return self._tokenizer.apply_chat_template(template_messages, **template_kwargs)
-        except Exception:
-            rendered: list[str] = []
-            if tools:
-                rendered.append("[TOOLS]\n" + json.dumps(tools, indent=2))
-            for message in template_messages:
-                role = str(message.get("role", "user")).upper()
-                content = str(message.get("content", ""))
-                rendered.append(f"[{role}]\n{content}")
-            rendered.append("[ASSISTANT]\n")
-            return "\n\n".join(rendered)
+            return base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise RuntimeError("mlx_vlm_invalid_data_url_payload") from exc
+
+    @staticmethod
+    def _generation_sampling_kwargs(sampling_cfg: dict[str, Any]) -> dict[str, float]:
+        kwargs: dict[str, float] = {}
+        temperature = sampling_cfg.get("temperature")
+        if isinstance(temperature, (int, float)):
+            kwargs["temperature"] = float(temperature)
+        top_p = sampling_cfg.get("topP", sampling_cfg.get("top_p"))
+        if isinstance(top_p, (int, float)):
+            kwargs["top_p"] = float(top_p)
+        return kwargs
+
+    def _prepare_request(self, messages: list[dict[str, Any]]) -> VlmPreparedRequest:
+        prompt_messages: list[dict[str, Any]] = []
+        image_paths: list[str] = []
+        audio_paths: list[str] = []
+        temp_dir: tempfile.TemporaryDirectory[str] | None = None
+
+        for message in messages:
+            next_message = dict(message)
+            parts = message.get("parts")
+            if isinstance(parts, list):
+                text_parts: list[str] = []
+                image_placeholders: list[str] = []
+                audio_placeholders: list[str] = []
+                for part in parts:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = str(part.get("type", ""))
+                    if part_type == "text":
+                        text = part.get("text")
+                        if isinstance(text, str) and text:
+                            text_parts.append(text)
+                        continue
+                    if part_type not in {"image", "audio"}:
+                        continue
+                    data_url = part.get("data_url")
+                    mime_type = str(part.get("mime_type", ""))
+                    if not isinstance(data_url, str):
+                        raise RuntimeError(f"mlx_vlm_{part_type}_missing_data_url")
+                    if temp_dir is None:
+                        temp_dir = tempfile.TemporaryDirectory(prefix="mlx-vlm-input-")
+                    suffix = self._media_suffix(mime_type, part_type)
+                    payload = self._decode_data_url(data_url)
+                    media_path = Path(temp_dir.name) / f"{part_type}-{len(image_paths) + len(audio_paths)}{suffix}"
+                    media_path.write_bytes(payload)
+                    if part_type == "image":
+                        image_paths.append(str(media_path))
+                        image_placeholders.append("<|image|>")
+                    else:
+                        audio_paths.append(str(media_path))
+                        audio_placeholders.append("<|audio|>")
+                content_parts = [*image_placeholders, *text_parts, *audio_placeholders]
+                next_message["content"] = "\n".join(content_parts) if content_parts else str(message.get("content", ""))
+            prompt_messages.append(next_message)
+
+        return VlmPreparedRequest(
+            prompt=self._build_prompt(prompt_messages),
+            image_paths=image_paths,
+            audio_paths=audio_paths,
+            temp_dir=temp_dir,
+        )
 
     def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
-        final_result: BackendResult | None = None
-        for event in self.stream_generate(messages, max_tokens, tools=tools):
-            if isinstance(event, BackendResult):
-                final_result = event
-        if final_result is None:
-            raise RuntimeError("mlx_generation_returned_no_result")
-        return final_result
+        if tools:
+            raise RuntimeError("mlx_vlm_tools_not_supported")
 
-    def stream_generate(
-        self,
-        messages: list[dict[str, Any]],
-        max_tokens: int | None,
-        tools: list[dict[str, Any]] | None = None,
-        *,
-        _hallucination_retry_used: bool = False,
-    ):
-        prompt = self._build_prompt(messages, tools=tools)
         effective_max_tokens = self._max_output_tokens
         if isinstance(max_tokens, int) and max_tokens > 0:
             effective_max_tokens = min(max_tokens, self._max_output_tokens)
 
+        prepared = self._prepare_request(messages)
         generation_started = time.perf_counter()
-        final_response = None
-        chunks: list[str] = []
-        buffered_chunks: list[str] = []
-        streaming_mode: str | None = None
-        stream_kwargs: dict[str, Any] = {"max_tokens": effective_max_tokens}
-        if self._sampler is not None:
-            stream_kwargs["sampler"] = self._sampler
         try:
-            for response in self._stream_generate(
+            response = self._generate(
                 self._model,
-                self._tokenizer,
-                prompt,
-                **stream_kwargs,
-            ):
-                final_response = response
-                if response.text:
-                    chunks.append(response.text)
-                    if streaming_mode == "tool":
-                        # Keep accumulating in buffered_chunks too — if the
-                        # final parse fails, we need to flush these as text
-                        # rather than silently dropping them.
-                        buffered_chunks.append(response.text)
-                        continue
-                    if streaming_mode == "text":
-                        # If the model started out looking like plain text but
-                        # now emits tool-call or channel markup, pivot into
-                        # "tool" (buffered) mode so we stop streaming raw
-                        # markup to the client. Anything already streamed is
-                        # already gone, but we contain further leakage and let
-                        # the final parse decide.
-                        if (
-                            _contains_tool_call_marker(response.text)
-                            or response.text.lstrip().startswith("<|tool_call")
-                            or _contains_channel_marker(response.text)
-                        ):
-                            streaming_mode = "tool"
-                            buffered_chunks.append(response.text)
-                            continue
-                        yield BackendStreamChunk(text=response.text)
-                        continue
-                    buffered_chunks.append(response.text)
-                    buffered_text = "".join(buffered_chunks)
-                    if (
-                        buffered_text.lstrip().startswith("call:")
-                        or buffered_text.lstrip().startswith("<|tool_call")
-                        or _contains_tool_call_marker(buffered_text)
-                        or _contains_channel_marker(buffered_text)
-                    ):
-                        streaming_mode = "tool"
-                        continue
-                    if _looks_like_tool_call_prefix(buffered_text) or _looks_like_channel_prefix(buffered_text):
-                        continue
-                    streaming_mode = "text"
-                    for chunk_text in buffered_chunks:
-                        yield BackendStreamChunk(text=chunk_text)
-                    buffered_chunks.clear()
+                self._processor,
+                prepared.prompt,
+                image=prepared.image_paths or None,
+                audio=prepared.audio_paths or None,
+                max_tokens=effective_max_tokens,
+                verbose=False,
+                **self._sampling_kwargs,
+            )
         except Exception as exc:  # pragma: no cover - depends on local runtime
-            raise RuntimeError(f"mlx_generation_failed:{exc}") from exc
+            raise RuntimeError(f"mlx_vlm_generation_failed:{exc}") from exc
+        finally:
+            prepared.cleanup()
 
-        if final_response is None:
-            raise RuntimeError("mlx_generation_returned_no_response")
-
-        content = "".join(chunks).strip()
-        if not content:
-            content = str(getattr(final_response, "text", "")).strip()
-        # If we buffered anything in "tool" mode (or never committed) and the
-        # final content does NOT parse as a tool call, flush those buffered
-        # chunks as plain text so the SSE client actually sees what the model
-        # emitted instead of an empty assistant turn. We run the flush through
-        # strip_channel_markup so raw ``<|channel|>...`` / ``<|message|>``
-        # tokens never leak to the client — callers only ever see the
-        # ``final`` channel content when channel markup was present.
-        if streaming_mode != "text" and buffered_chunks:
-            _leftover, _reason, parsed_tool_calls = parse_tool_calls(content)
-            if parsed_tool_calls is None:
-                raw_buffered = "".join(buffered_chunks)
-                # If the buffered text contains tool-call markers (``<|tool_call|>``
-                # sentinels or a ``call:<name>`` token) but we couldn't form a
-                # valid parse, it's a malformed tool-call attempt. Skip the
-                # flush — _build_result will produce a clean containment
-                # message — so the raw markup never reaches the client.
-                if not _contains_tool_call_marker(raw_buffered):
-                    flushed_text = strip_channel_markup(raw_buffered)
-                    if flushed_text:
-                        yield BackendStreamChunk(text=flushed_text)
-                buffered_chunks.clear()
-
-        result = self._build_result(messages, final_response, content, generation_started, tools=tools)
-
-        # Hallucinated-tool recovery. _build_result returns a "[tool-call
-        # error]" content string with finish_reason=stop and tool_calls=None
-        # when every parsed tool_call was hallucinated. Without a retry the
-        # user sees that error as the final answer. Feed it back into the
-        # model as a synthetic tool-result and re-stream so Gemma can answer
-        # the user's underlying question. The recursion guard caps this at
-        # one retry — if the model hallucinates again we fall through to the
-        # containment message, preserving the break-glass safety behavior.
-        if (
-            not _hallucination_retry_used
-            and tools
-            and result.tool_calls is None
-            and isinstance(result.content, str)
-            and result.content.startswith("[tool-call error]")
-        ):
-            _leftover, _reason, original_tool_calls = parse_tool_calls(strip_channel_markup(content))
-            if original_tool_calls:
-                retry_messages = list(messages) + _build_hallucination_retry_messages(
-                    original_tool_calls, result.content
-                )
-                for event in self.stream_generate(
-                    retry_messages,
-                    max_tokens,
-                    tools=tools,
-                    _hallucination_retry_used=True,
-                ):
-                    yield event
-                return
-
-        yield result
-
-    def _build_result(
-        self,
-        messages: list[dict[str, Any]],
-        final_response: Any,
-        content: str,
-        generation_started: float,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> BackendResult:
-        prompt_tokens = int(getattr(final_response, "prompt_tokens", 0) or 0)
-        completion_tokens = int(getattr(final_response, "generation_tokens", 0) or 0)
+        raw_content = response if isinstance(response, str) else getattr(response, "text", "")
+        content = strip_channel_markup(str(raw_content or "")).strip()
+        prompt_tokens = int(getattr(response, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(response, "generation_tokens", 0) or 0)
         if prompt_tokens <= 0:
             prompt_tokens = max(1, sum(len(str(m.get("content", "")).split()) for m in messages))
         if completion_tokens <= 0:
             completion_tokens = max(1, len(content.split()))
 
-        prefill_ms = None
-        prompt_tps = getattr(final_response, "prompt_tps", None)
-        if isinstance(prompt_tps, (int, float)) and prompt_tps > 0 and prompt_tokens > 0:
-            prefill_ms = int((prompt_tokens / float(prompt_tps)) * 1000)
-
-        generation_ms = None
-        generation_tps = getattr(final_response, "generation_tps", None)
-        if isinstance(generation_tps, (int, float)) and generation_tps > 0 and completion_tokens > 0:
-            generation_ms = int((completion_tokens / float(generation_tps)) * 1000)
-
         total_ms = int((time.perf_counter() - generation_started) * 1000)
         load_ms = self._load_ms if not self._load_consumed else 0
         self._load_consumed = True
-        raw_finish_reason = str(getattr(final_response, "finish_reason", "stop") or "stop")
-        # Strip Harmony/Gemma channel markup before tool-call parsing so we
-        # don't match ``call:...`` tokens that live inside a hidden-reasoning
-        # segment, and so the final content handed to the client is clean.
-        content = strip_channel_markup(content)
-        parsed_content, parsed_finish_reason, parsed_tool_calls = parse_tool_calls(content)
-
-        # If we truncated mid-tool-call (length-limited) and the parser failed,
-        # don't leak half-emitted `call:...{` markup to the client. Return an
-        # explicit `length` finish with empty content so the caller can treat
-        # it as a truncated response rather than as textual leakage.
-        if (
-            parsed_tool_calls is None
-            and raw_finish_reason == "length"
-            and _contains_tool_call_marker(parsed_content)
-        ):
-            parsed_content = ""
-        # Malformed tool-call emission: the model wrote tool-call sentinels
-        # but the parser could not read them (usually a missing/extra pipe
-        # like `<|tool_call>` / `<tool_call|>`, or a mangled body). Replace
-        # the raw leaked markup with a clean containment message so the
-        # client never sees the internal tokens. Finish as `stop` so the
-        # caller does not retry-loop on a broken call.
-        elif (
-            parsed_tool_calls is None
-            and _contains_tool_call_marker(parsed_content)
-        ):
-            parsed_content = (
-                "[tool-call error] The model emitted a malformed tool call "
-                "that could not be parsed. No tool was executed. Please "
-                "answer without invoking any tool."
-            )
-            parsed_finish_reason = "stop"
-
-        # Guard against hallucinated tool names — the model sometimes calls a
-        # tool that was not in the request's tools[] list. If every call is
-        # hallucinated, surface a clear textual error with finish_reason=stop
-        # so the caller does NOT keep replaying and re-calling the same
-        # nonexistent tool in an infinite loop. This is the "break-glass" fix
-        # for the known "Gemma loops on a nonexistent weather tool" bug.
-        kept_tool_calls = parsed_tool_calls
-        hallucinated: list[str] = []
-        if parsed_tool_calls is not None:
-            kept_tool_calls, hallucinated = filter_hallucinated_tool_calls(parsed_tool_calls, tools)
-            if kept_tool_calls is None and hallucinated:
-                names = ", ".join(sorted({name for name in hallucinated if name}))
-                message = (
-                    "[tool-call error] The model attempted to call a tool that is not available"
-                )
-                if names:
-                    message += f" (requested: {names})."
-                else:
-                    message += "."
-                message += " No tool was executed. Please answer without invoking that tool."
-                parsed_content = message
-                parsed_finish_reason = "stop"
-                kept_tool_calls = None
-
-        if kept_tool_calls:
-            finish_reason = "tool_calls"
-        elif parsed_tool_calls is not None and kept_tool_calls is None and hallucinated:
-            finish_reason = "stop"
-        else:
-            finish_reason = parsed_finish_reason if kept_tool_calls else raw_finish_reason
-
+        peak_memory = getattr(response, "peak_memory", None)
         return BackendResult(
-            content=parsed_content,
-            finish_reason=finish_reason,
+            content=content,
+            finish_reason=str(getattr(response, "finish_reason", "stop") or "stop"),
             usage={
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -815,16 +730,23 @@ class MlxBackend(WorkerBackend):
             metrics={
                 "queue_wait_ms": 0,
                 "load_ms": load_ms,
-                "prefill_ms": prefill_ms,
-                "generation_ms": generation_ms,
+                "prefill_ms": None,
+                "generation_ms": None,
+                "peak_memory_gb": float(peak_memory) if isinstance(peak_memory, (int, float)) else None,
                 "total_ms": total_ms,
             },
-            tool_calls=kept_tool_calls,
+            tool_calls=None,
         )
+
+
+MlxBackend = MlxVlmTurboQuantBackend
 
 
 def build_backend(config: dict[str, Any]) -> WorkerBackend:
     worker_cfg = config.get("worker", {})
     if bool(worker_cfg.get("stubMode", False)):
         return StubBackend()
-    return MlxBackend(config)
+    descriptor = backend_descriptor(config)
+    if descriptor.backend_id == "mlx_vlm_turboquant":
+        return MlxVlmTurboQuantBackend(config)
+    raise RuntimeError(f"unknown_backend_adapter:{configured_backend_id(config)}")

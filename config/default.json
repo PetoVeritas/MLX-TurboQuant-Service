@@ -68,6 +68,7 @@
     "staleAfterSeconds": 900
   },
   "worker": {
+    "backend": "mlx_vlm_turboquant",
     "startupTimeoutMs": 120000,
     "requestTimeoutMs": 180000,
     "probeTimeoutMs": 1000,

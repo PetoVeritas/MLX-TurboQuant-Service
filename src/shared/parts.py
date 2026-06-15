@@ -7,6 +7,8 @@ import binascii
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from shared.backend_adapters import backend_supported_modalities
+
 
 ACTIVE_MODALITIES = ("text", "image", "video", "audio")
 RESERVED_MODALITIES = ("document",)
@@ -67,13 +69,6 @@ def configured_modalities(config: dict[str, Any]) -> set[str]:
             enabled.add(modality)
     enabled.add("text")
     return enabled
-
-
-def backend_supported_modalities(_config: dict[str, Any]) -> set[str]:
-    # Phase 1 wires the contract and status surface only. Current backends
-    # still consume text prompts; real multimodal support lands behind this
-    # boundary in later phases.
-    return {"text"}
 
 
 def modalities_status(config: dict[str, Any]) -> dict[str, Any]:

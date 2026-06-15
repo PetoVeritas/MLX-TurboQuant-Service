@@ -8,6 +8,7 @@
     "maxOutputTokens": 1024
   },
   "worker": {
+    "backend": "mlx_vlm_turboquant",
     "pythonExecutable": "/absolute/path/to/mlx-python-runtime/.venv/bin/python",
     "stubMode": false,
     "lazyLoad": true,
