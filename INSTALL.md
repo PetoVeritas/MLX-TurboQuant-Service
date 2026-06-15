@@ -4,17 +4,17 @@ This project is a local MLX-backed inference service for Apple Silicon Macs.
 It is not a one-click app. A new machine needs four things:
 
 1. the repository code
-2. a local Python runtime for the worker
+2. a local Python runtime for the worker (with patched `mlx-vlm`)
 3. local model files
 4. a machine-specific `config/local.json`
 
 ## Requirements
 
 - **Apple Silicon Mac.** Intel Macs are not supported.
-- **Unified memory depends on the model.** 16GB can work for smaller 2B/4B-class MLX models. The default single 26B service is tight on 32GB but workable with headroom management. Running both the 26B service and an E4B sibling service at the same time should be treated as a 48GB+ setup.
-- **Python 3.14.** Tested on 3.14.4. Minimum supported is 3.11, but recent 3.13 / 3.14 patch versions are what's actively tested. If you don't already have 3.14, install it via Homebrew: `brew install python@3.14`.
-- **~20GB of free disk space** for the default model. More if you plan to try other variants.
-- **HuggingFace CLI** for the model download step: `pip install "huggingface_hub[cli]"`.
+- **Unified memory depends on the model.** 48 GB is recommended for running 26B and E2B lanes concurrently. 16 GB works for E2B alone. The 26B model peaks at ~29 GB under `mlx-vlm`.
+- **Python 3.13+** (tested on 3.13 and 3.14). Minimum supported is 3.11. If you don't already have it, install via Homebrew: `brew install python@3.14`.
+- **~15 GB of free disk space** per TurboQuant model variant (more for multiple lanes).
+- **HuggingFace CLI** for model downloads: `pip install "huggingface_hub[cli]"`.
 
 ## What is in GitHub vs what is local
 
@@ -23,6 +23,7 @@ Tracked in the repo:
 - helper scripts under `scripts/`
 - default config and example local config
 - benchmark fixtures
+- vendored runtime patch under `runtime-patches/`
 - README / docs
 
 Not tracked in the repo:
@@ -44,41 +45,58 @@ cd mlx-turbo-gemma-service
 The supervisor is standard-library Python and is started by `./scripts/start` using `python3`.
 The worker is separate and uses the Python executable configured in `config/local.json`.
 
-Create a virtual environment for the worker, using Python 3.14:
+Create a virtual environment for the worker:
 
 ```bash
-# Path below assumes Homebrew on Apple Silicon. Adjust if installed elsewhere.
+# Adjust Python path for your install. Homebrew on Apple Silicon:
 /opt/homebrew/opt/python@3.14/bin/python3.14 -m venv runtime/mlx-python-runtime/.venv
 source runtime/mlx-python-runtime/.venv/bin/activate
-python --version   # should print 3.14.x
+python --version   # should print 3.14.x (or 3.13.x)
 ```
 
-Install the worker's runtime dependency:
+Install the worker runtime dependency:
 
 ```bash
 pip install --upgrade pip
-pip install mlx-lm
+pip install mlx-vlm==0.6.3
 ```
 
-The service is currently tested with `mlx-lm==0.31.2`. Later versions will likely work, but if you hit a regression after upgrading, pinning to the tested version is a good first troubleshooting step.
+The service is tested with `mlx-vlm==0.6.3` and `mlx==0.31.2`. Later versions may work but require retesting the elastic-KV patch.
 
-Notes:
-- The worker imports `mlx_lm` directly.
-- The repo does not currently ship a pinned dependency file. If you want reproducible installs across machines, generate one with `pip freeze > requirements.txt` after a known-good install.
+### Apply the elastic-KV patch
+
+Gemma 4 E2B and E4B TurboQuant models fail to load under unpatched `mlx-vlm` because elastic (KV-shared) layers ship per-layer K/V weights that the sanitizer drops. The patch allocates those modules for all layers, matching `mlx-lm`'s behavior.
+
+```bash
+cd runtime/mlx-python-runtime/.venv/lib/python3.14/site-packages/
+patch -p1 < ../../../../../runtime-patches/mlx-vlm-0.6.3-gemma4-elastic-kv.patch
+```
+
+Verify the patch applied:
+
+```bash
+../../../../../scripts/verify-mlx-vlm-turboquant-patch.sh
+```
+
+**Every `mlx-vlm` upgrade must retest against E2B/E4B/26B load matrix.** The patch is version-specific.
 
 ## 3. Download the model
 
-The default model is `mlx-community/gemma-4-26b-a4b-it-4bit` (~15GB on disk). Download it to any directory you control:
+The production lanes use TurboQuant models from the `majentik` org on HuggingFace:
 
 ```bash
+# 26B (port 4017)
 huggingface-cli download \
-  mlx-community/gemma-4-26b-a4b-it-4bit \
-  --local-dir ~/models/gemma-4-26b-a4b-it-4bit
+  majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit \
+  --local-dir ~/models/majentik-gemma-4-26b-a4b-it-turboquant-mlx-8bit
+
+# E2B (ports 4018, 4019)
+huggingface-cli download \
+  majentik/gemma-4-E2B-it-TurboQuant-MLX-4bit \
+  --local-dir ~/models/majentik-gemma-4-E2B-it-TurboQuant-MLX-4bit
 ```
 
-If the download fails with a 401 or 403, the repo is gated — run `huggingface-cli login` first, accept the license on the HuggingFace web UI for that model, then retry.
-
-You will point `config/local.json` at the absolute path of the downloaded directory in the next step.
+If the download fails with a 401 or 403, the repo is gated — run `huggingface-cli login`, accept the license on the HuggingFace web UI, then retry.
 
 ## 4. Create `config/local.json`
 
@@ -88,37 +106,51 @@ Start from the example file:
 cp config/local.example.json config/local.json
 ```
 
-Then edit `config/local.json`.
-At minimum, set these fields:
+Then edit `config/local.json`. At minimum, set:
 
 ```json
 {
   "model": {
-    "id": "your-model-id",
-    "path": "/absolute/path/to/your/model"
+    "id": "gemma-local-mlx-turboquant-26b-a4b-8bit",
+    "path": "/absolute/path/to/majentik-gemma-4-26b-a4b-it-turboquant-mlx-8bit",
+    "contextWindowTokens": 73728,
+    "maxOutputTokens": 8192
   },
   "worker": {
+    "backend": "mlx_vlm_turboquant",
     "pythonExecutable": "/absolute/path/to/runtime/mlx-python-runtime/.venv/bin/python"
+  },
+  "modalities": {
+    "text": { "enabled": true },
+    "image": { "enabled": true, "allowedMimeTypes": ["image/png", "image/jpeg", "image/webp"], "transport": ["data_url"] },
+    "audio": { "enabled": true, "allowedMimeTypes": ["audio/wav", "audio/x-wav"], "transport": ["data_url"] },
+    "strictCapabilityCheck": true
+  },
+  "governor": {
+    "enabled": true,
+    "instanceId": "mlx-26b",
+    "priority": 1,
+    "rssEstimateLoadedGb": 29.0,
+    "ceilingGb": 34.0
   }
 }
 ```
 
 Important fields:
-- `model.id`: the model name the service will expose to clients
-- `model.path`: absolute path to the downloaded local model directory
+- `model.id`: model name exposed to clients
+- `model.path`: absolute path to the downloaded model directory
+- `model.contextWindowTokens`: context window (73728 for 26B/E2B at full, 16384 for voice E2B)
+- `model.maxOutputTokens`: max output tokens (default 8192)
 - `worker.pythonExecutable`: absolute path to the worker venv Python
+- `worker.backend`: must be `mlx_vlm_turboquant`
+- `modalities`: enable image/audio as needed per lane; `strictCapabilityCheck` rejects undeclared modalities with 422
 
 Useful optional fields:
 - `server.port`: default is `4017`
 - `worker.lazyLoad`: default `true`
 - `worker.idleUnload.enabled`: default `true`
 - `worker.idleUnload.idleMs`: default `300000`
-- `worker.startupTimeoutMs`
-- `worker.requestTimeoutMs`
-- `model.maxOutputTokens`
-- `model.sampling.temperature`
-- `model.sampling.topP`
-- `logging.level`
+- `governor`: shared memory admission control (see README)
 
 ## 5. Start the service
 
@@ -142,7 +174,7 @@ Basic health:
 curl http://127.0.0.1:4017/health
 ```
 
-Model list:
+Model list (includes modality metadata):
 
 ```bash
 curl http://127.0.0.1:4017/v1/models
@@ -154,7 +186,7 @@ Run the smoke test:
 ./scripts/smoke-test
 ```
 
-**First-request latency.** With `worker.lazyLoad` at its default (`true`), the very first request after startup triggers the model load, which can take 15–30 seconds on an M-series Mac depending on the model and disk speed. The smoke test may appear to hang briefly on its first call — that's expected. Subsequent requests are fast.
+**First-request latency.** With `worker.lazyLoad` at its default (`true`), the very first request triggers the model load, which can take 15–30 seconds. Subsequent requests are fast.
 
 ## 7. Stop or restart
 
@@ -165,7 +197,7 @@ Run the smoke test:
 
 ## Environment-variable overrides
 
-Instead of hardcoding some values in `config/local.json`, the service also supports these environment variables:
+The service supports these environment variables:
 
 - `MLX_GEMMA_HOST`
 - `MLX_GEMMA_PORT`
@@ -181,10 +213,10 @@ Instead of hardcoding some values in `config/local.json`, the service also suppo
 Set `model.path` in `config/local.json`.
 
 ### `mlx_model_path_missing:...`
-The configured model path does not exist on disk. Double-check the absolute path and that the model download completed fully.
+The configured model path does not exist on disk. Check the absolute path and that the model download completed fully.
 
 ### `mlx_runtime_import_failed:...`
-The worker Python environment does not have a working `mlx_lm` install. Confirm `worker.pythonExecutable` points at the right venv and re-run `pip install mlx-lm` inside it.
+The worker Python environment does not have a working `mlx-vlm` install. Confirm `worker.pythonExecutable` points at the right venv and re-run `pip install mlx-vlm==0.6.3` inside it. Make sure the elastic-KV patch is applied (see step 2).
 
 ### Service starts but `/ready` is not OK
 Check in this order:
@@ -194,22 +226,31 @@ Check in this order:
 - `tmp/supervisor.log`
 
 ### Port conflict (`address already in use`)
-Something else is bound to port 4017. Either stop the other process or change `server.port` in `config/local.json`.
+Something else is bound to the port. Either stop the other process or change `server.port` in `config/local.json`.
 
 ### Worker keeps restarting
-Tail `tmp/supervisor.log` and grep for `worker_terminated` or tracebacks. Most common causes: OOM during model load, a bad model path, or an `mlx-lm` version mismatch.
+Tail `tmp/supervisor.log` and grep for `worker_terminated` or tracebacks. Common causes: OOM during model load, bad model path, or an `mlx-vlm` version mismatch.
 
 ### OOM during model load
-The default 26B 4-bit model needs roughly 15GB of unified memory for weights, plus overhead for KV cache and macOS. On a 16GB Mac it will OOM. Either run on a larger machine, or switch to a smaller model (a 2B or 4B MLX variant) and update `model.id` / `model.path` in `config/local.json` accordingly.
+The 26B TurboQuant 8-bit model needs ~29 GB of unified memory under `mlx-vlm` at peak. On a 32 GB Mac it will be tight. On a 48 GB Mac, 26B and one E2B lane can co-reside. Either run on a larger machine or use the E2B model alone.
+
+### `governor_refused:need=Xgb ceiling=Ygb`
+The shared memory governor refused admission because loading the model would exceed the configured ceiling. Options:
+- Increase `ceilingGb` in `config/local.json` (ensure it stays under physical memory).
+- Lower `rssEstimateLoadedGb` (only if the estimate is too conservative; 26B should be ~29 GB, E2B ~6 GB).
+- Unload a lower-priority lane first via `/admin/worker/unload`.
+
+### Tool calls return `unsupported_modality`
+The `tools` parameter requires the model to support tool calling. All current TurboQuant models support it. If you see this error, check that the backend is `mlx_vlm_turboquant` (not an older `mlx_lm` backend).
 
 ### `huggingface-cli download` fails with 401 / 403
-The model repo is gated. Run `huggingface-cli login`, accept the license on the HuggingFace web UI for that model, and retry the download.
+The model repo is gated. Run `huggingface-cli login`, accept the license on the HuggingFace web UI, and retry.
 
 ## Reproducibility note
 
 The repository is enough to share the app itself, but a fresh machine still needs:
-- a local worker virtualenv
+- a local worker virtualenv with `mlx-vlm==0.6.3` and the elastic-KV patch applied
 - local model files
 - local config
 
-If you want fully reproducible setup for other people, the next improvement should be a pinned `requirements.txt` for the worker environment plus a tighter first-run setup section in `README.md`.
+If you want fully reproducible setup, the next improvement should be a pinned `requirements.txt` for the worker environment plus an automated patch-apply step in setup.

@@ -1,10 +1,20 @@
-# MLX TurboQuant Service — Supervised, Local Gemma 4 26B on Apple Silicon
+# MLX TurboQuant Service — Supervised, Local Gemma 4 on Apple Silicon
 
-Runs Gemma 4 26B-A4B locally on Apple Silicon via MLX and exposes it as an OpenAI-compatible provider boundary for OpenClaw-style agent stacks. A lightweight HTTP supervisor manages a separate worker process so the model stays up, restarts cleanly, and behaves predictably under agent workloads — single-target on purpose, not a generic multi-model surface.
+Runs Gemma 4 models locally on Apple Silicon via MLX and exposes them as OpenAI-compatible provider boundaries for OpenClaw-style agent stacks. A lightweight HTTP supervisor manages a separate worker process so the model stays up, restarts cleanly, and behaves predictably under agent workloads — single-target on purpose, not a generic multi-model surface.
 
-Current 26B setup note: the main service currently runs the 8-bit MLX weights at [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit) on port `4017`. In this repository, “TurboQuant” refers to the runtime/service path and KV-cache experimentation around that model family, not to a separate published 26B TQPlus weight artifact.
+The primary lane is the **Gemma 4 26B-A4B** TurboQuant model — the flagship, highest-priority service this stack is built around. The smaller E2B lanes run alongside it for audio-capable and voice workloads.
 
-Current E4B setup note: the sibling test service runs [`mlx-community/gemma-4-e4b-it-8bit`](https://huggingface.co/mlx-community/gemma-4-e4b-it-8bit) on port `4018` for small-model agent usage.
+The backend is **`mlx-vlm`** (with a vendored elastic-KV patch for Gemma 4 E2B/E4B TurboQuant models). It supports **text, image, and audio** modalities with **tool calling** (OpenAI-compatible `tools` parameter). Model support depends on the artifact: 26B TurboQuant supports text+image; E2B TurboQuant supports text+image+audio.
+
+## Current Production Lanes
+
+| Port | Model | Quant | Context | Modalities | Priority |
+|------|-------|-------|---------|------------|----------|
+| 4017 | Gemma 4 26B A4B IT | TurboQuant 8-bit | 73728 | image, text | 1 |
+| 4018 | Gemma 4 E2B IT | TurboQuant 4-bit | 73728 | audio, image, text | 2 |
+| 4019 | Gemma 4 E2B IT | TurboQuant 4-bit | 16384 | audio, image, text | 3 |
+
+All three lanes use the same `mlx-vlm` runtime with the elastic-KV patch. 4018 and 4019 run separate instances of the same E2B weights at different context windows.
 
 ## Why this exists
 
@@ -12,6 +22,8 @@ Getting a model to produce tokens is not enough for real agent use.
 This project exists to make local Gemma 4 inference **with TurboQuant** operationally usable by adding:
 
 - a stable OpenAI-style chat endpoint with streaming
+- tool calling with hallucinated-tool containment
+- multimodal inference (image, audio) via `mlx-vlm`
 - supervised worker lifecycle management
 - local health and admin endpoints
 - smoke, recovery, and timeout testing
@@ -21,9 +33,14 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
 
 - **OpenAI-style API**
   - `POST /v1/chat/completions` (streaming and non-streaming)
-  - tool-call passthrough with hallucinated-tool containment
+  - tool-call support: pass an OpenAI `tools` array; model responds with `finish_reason=tool_calls` and structured `tool_calls` in the response
+  - hallucinated tool containment: calls to undeclared tools are filtered and surfaced as errors
   - configurable sampling (temperature, top-p)
   - strips model-internal reasoning markers so only the final answer reaches clients
+- **Multimodal input**
+  - image: PNG/JPEG/WebP via data URL
+  - audio: WAV/MP3/M4A via data URL
+  - modality support is declared per-model via the `modalities` config; `strictCapabilityCheck` rejects requests for disabled modalities with `422 unsupported_modality`
 - **Supervisor + worker design**
   - keeps inference isolated from the control plane over a JSON-framed subprocess pipe
 - **Bounded request queue**
@@ -46,7 +63,7 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
 |--------|----------|-------------|
 | GET | `/health` | Basic health check |
 | GET | `/ready` | Readiness and worker-state view |
-| GET | `/v1/models` | Exposed model list |
+| GET | `/v1/models` | Exposed model list (includes modality metadata) |
 | GET | `/admin/stats` | Worker metrics and config snapshot |
 | POST | `/v1/chat/completions` | OpenAI-style chat completions (SSE streaming supported) |
 | POST | `/admin/worker/unload` | Unload the worker |
@@ -63,6 +80,7 @@ mlx-turbo-gemma-service/
 ├── config/              # default + example local override
 ├── scripts/             # start/stop/smoke/fixture/soak helpers
 ├── benchmarks/          # prompt fixtures and shared prompt text
+├── runtime-patches/     # vendored patches for mlx-vlm
 ├── runtime/             # dedicated MLX Python virtualenv (gitignored)
 ├── logs/                # runtime logs (gitignored)
 └── tmp/                 # scratch runtime files (gitignored)
@@ -97,33 +115,73 @@ Configuration is split between:
 - `config/local.example.json` for example overrides
 - `config/local.json` for machine-specific model/runtime settings (gitignored)
 
-Typical local settings include model path, model id, Python runtime path, startup/request/probe timeouts, lazy-load behavior, idle-unload behavior, governor behavior, and sampling (temperature, top-p).
+Typical local settings include model path, model id, Python runtime path, startup/request/probe timeouts, lazy-load behavior, idle-unload behavior, governor behavior, modalities, and sampling (temperature, top-p).
 
-Note: `model.maxOutputTokens` defaults to **8192** (raised from the previous 1024) so longer agent turns and tool-call sequences fit without per-request overrides. Lower it in `config/local.json` if you need to cap output for memory or latency reasons.
+### Modality configuration
+
+The `modalities` block in config controls which input types each lane accepts:
+
+```json
+{
+  "modalities": {
+    "text": { "enabled": true },
+    "image": { "enabled": true, "allowedMimeTypes": ["image/png", "image/jpeg", "image/webp"], "transport": ["data_url"] },
+    "audio": { "enabled": true, "allowedMimeTypes": ["audio/wav", "audio/x-wav"], "transport": ["data_url"] },
+    "video": { "enabled": false },
+    "document": { "enabled": false },
+    "strictCapabilityCheck": true
+  }
+}
+```
+
+Effective modalities for a request are the intersection of **configured** (lane config), **backend-supported** (what the loaded model can do), and the request payload. When `strictCapabilityCheck` is `true`, requests for disabled modalities are rejected with `422 unsupported_modality`.
+
+### Governor sizing
+
+Recommended local shape (based on actual memory measurements):
+
+- 26B lane: `rssEstimateLoadedGb: 29.0` (actual peak ~28.9 GB), `priority: 1`
+- E2B lane: `rssEstimateLoadedGb: 6.0` (actual peak ~4.4 GB), `priority: 2` or `3`
+- Shared ceiling: `ceilingGb: 34.0` (on 48 GB machines)
+- Keep `allowLowerPriorityToPreemptHigher: false` so E2B lanes cannot preempt 26B by default
+
+When a cold load would exceed the ceiling, the governor refuses admission with `governor_refused` unless a configured preemption path can safely unload lower-priority rows first.
+
+Note: the 26B TurboQuant model uses ~29 GB at peak under `mlx-vlm`. Configuring the estimate at 20 GB (the `mlx-lm` baseline) causes incorrect admission decisions. Set it to at least 29 GB for accurate co-residency.
+
+## Tool Calling
+
+The service supports OpenAI-compatible tool calling. Pass a `tools` array in the request:
+
+```json
+{
+  "model": "gemma-local-mlx-turboquant-26b-a4b-8bit",
+  "messages": [{"role": "user", "content": "What's the weather in DC?"}],
+  "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
+  "max_tokens": 32
+}
+```
+
+The model responds with `finish_reason: "tool_calls"` and structured `tool_calls` in the message. Multi-turn tool-call conversations (where the assistant has prior `tool_calls` in history) are supported — the service decodes tool-call arguments before passing to the Gemma chat template.
+
+Hallucinated tool calls (calls to functions not declared in the `tools` array) are filtered out and surfaced as an error message in the response content.
 
 ## Request Queue
 
-The supervisor intentionally keeps inference single-worker and local-first. It can now absorb a bounded amount of overlap with `worker.queue.maxDepth`:
+The supervisor intentionally keeps inference single-worker and local-first. It can absorb a bounded amount of overlap with `worker.queue.maxDepth`:
 
 - `0`: no queue; overlapping requests are rejected as `worker_busy`.
-- `1`: one active request plus one queued request. This is the recommended local default for the 26B, E4B, and voice-helper lanes.
+- `1`: one active request plus one queued request.
 
-Queued requests wait for the active request to finish, then run through the same worker path. If the queue is already full, `POST /v1/chat/completions` returns `409 queue_full` with the current queue depth. Queue depth, max depth, and queue metrics are visible in `/admin/stats`.
+Queued requests wait for the active request to finish, then run through the same worker path. If the queue is already full, `POST /v1/chat/completions` returns `409 queue_full`.
 
-This is not continuous batching. It is a conservative FIFO guard for agent traffic so short overlaps do not fail immediately while the service remains predictable. Continuous batching is a separate future scheduler change.
+## Runtime Patch
 
-## Shared memory governor
+The service requires a patched `mlx-vlm` to load Gemma 4 E2B/E4B TurboQuant models. The patch fixes `mlx_vlm/models/gemma4/language.py` to allocate K/V modules for all layers (matching `mlx-lm`'s behavior) instead of skipping layers marked as KV-shared.
 
-The optional governor reserves estimated loaded-worker RSS in a JSON state file under `governor.stateDir`, protected by an advisory file lock. It is designed for sibling single-model services, not dynamic routing inside one supervisor.
+The patch file is at `runtime-patches/mlx-vlm-0.6.3-gemma4-elastic-kv.patch`. It must be applied to the `mlx-vlm` package inside the worker virtualenv after installation. A verification script is provided at `scripts/verify-mlx-vlm-turboquant-patch.sh`.
 
-Recommended local shape:
-
-- 26B: `governor.instanceId: "mlx-26b"`, `priority: 1`, `rssEstimateLoadedGb: 20.0`
-- E4B sibling: `governor.instanceId: "mlx-e4b"`, `priority: 2`, `rssEstimateLoadedGb: 12.0`
-- Shared ceiling: `ceilingGb: 32.0`
-- Keep `allowLowerPriorityToPreemptHigher: false` so the E4B lane cannot preempt 26B by default
-
-When a cold load would exceed the ceiling, the governor refuses admission with `governor_refused` unless a configured preemption path can safely unload lower-priority rows first. Set `governor.enabled: false` to return to independent service behavior.
+**Every `mlx-vlm` upgrade must retest against E2B/E4B/26B load matrix.** The patch is version-specific and carries a maintenance burden.
 
 ## KV-cache recommendation
 
@@ -132,9 +190,7 @@ For TurboQuant / KV-cache experiments, the current recommendation is asymmetric 
 - keep **K** high precision by default
 - compress **V** first if memory pressure requires it
 - avoid symmetric low-bit K/V compression as the default
-- validate any KV change with tiny factual, long-context retrieval, tool-call, and reclaim tests before using it for agent traffic. Keep heavier private stress fixtures outside the public repo unless they are intentionally curated for release
-
-The service does **not** currently expose stable KV tuning environment variables. Add documented knobs only when the underlying MLX cache path is wired and tested; until then, prefer known-good baseline cache behavior.
+- validate any KV change with tiny factual, long-context retrieval, tool-call, and reclaim tests before using it for agent traffic
 
 ## Helper Scripts
 
@@ -142,6 +198,7 @@ The service does **not** currently expose stable KV tuning environment variables
 - `scripts/state`
 - `scripts/smoke-test`
 - `scripts/smoke-ready-state.sh`
+- `scripts/smoke-e2b-runtime-parity.py`
 - `scripts/recovery-test`
 - `scripts/timeout-failure-test`
 - `scripts/list-fixtures`
@@ -150,18 +207,21 @@ The service does **not** currently expose stable KV tuning environment variables
 - `scripts/memory-profile`
 - `scripts/reclaim-profile`
 - `scripts/compare-lanes`
+- `scripts/verify-mlx-vlm-turboquant-patch.sh`
 
 ## Current Status
 
 This project has moved beyond scaffold-only bring-up and into real local MLX inference testing.
 It currently supports:
 
-- real Gemma completions through MLX with configurable sampling
-- streaming responses with channel-markup and tool-call containment
+- real Gemma completions through `mlx-vlm` with TurboQuant models
+- multimodal inference (image, audio) via data URL
+- tool calling with hallucinated-tool containment
+- streaming responses with channel-markup containment
 - supervised worker startup, idle unload, and recovery
 - readiness and stats inspection that stays responsive during active generation
 - cold/warm request validation and fixture-based cleanliness checks
-- optional shared memory-governor admission for 26B/E4B sibling services
+- shared memory-governor admission for sibling lanes
 - early hardening for OpenClaw compatibility
 
 ## Security
@@ -173,14 +233,14 @@ It currently supports:
 
 ## Requirements
 
-- Apple Silicon Mac
-- Python 3.11+ with an MLX-capable virtualenv (see `runtime/`)
-- local Gemma model files (for example, the 26B service can use [`majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`](https://huggingface.co/majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit), while a smaller sibling service can use [`mlx-community/gemma-4-e4b-it-8bit`](https://huggingface.co/mlx-community/gemma-4-e4b-it-8bit); set `model.path` in `config/default.json` or a local override)
+- Apple Silicon Mac (48 GB unified memory recommended for 26B + E2B co-residency)
+- Python 3.11+ (3.13/3.14 tested) with an `mlx-vlm`-capable virtualenv (see `runtime-patches/`)
+- local Gemma 4 TurboQuant model files from the `majentik` org on HuggingFace
 - OpenClaw-compatible workflow if used as a lane
 
 ## Development note
 
-Built AI-assisted, using my personal [OpenClaw](https://github.com/openclaw/openclaw) agents as my coding collaborators.
+Built AI-assisted, using personal [OpenClaw](https://github.com/openclaw/openclaw) agents as coding collaborators.
 
 ---
 

@@ -61,9 +61,9 @@
     "enabled": false,
     "instanceId": "mlx-26b",
     "priority": 1,
-    "rssEstimateLoadedGb": 20.0,
+    "rssEstimateLoadedGb": 29.0,
     "stateDir": "~/Library/Application Support/MLX-TurboQuant-Governor",
-    "ceilingGb": 32.0,
+    "ceilingGb": 34.0,
     "allowLowerPriorityToPreemptHigher": false,
     "staleAfterSeconds": 900
   },

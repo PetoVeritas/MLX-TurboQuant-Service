@@ -1,5 +1,5 @@
---- /Users/tyler/.openclaw/workspace/projects/gemma-mlx-service/spikes/mlx-vlm-20260615/language.py.before-phase0	2026-06-15 15:10:14
-+++ /Users/tyler/.openclaw/workspace/projects/gemma-mlx-service/spikes/mlx-vlm-20260615/.venv/lib/python3.14/site-packages/mlx_vlm/models/gemma4/language.py	2026-06-15 15:10:23
+--- a/mlx_vlm/models/gemma4/language.py
++++ b/mlx_vlm/models/gemma4/language.py
 @@ -377,13 +377,12 @@
          self.embed_scale = config.hidden_size**0.5
          num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
