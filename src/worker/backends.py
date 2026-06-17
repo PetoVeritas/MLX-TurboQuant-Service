@@ -837,17 +837,18 @@ class MlxVlmDiffusionGemmaBackend(WorkerBackend):
             supported.add("image")
         return supported & set(self.supported_modality_set)
 
-    def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
+    def _build_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+        template_messages = _decode_assistant_tool_call_arguments(messages) if tools else messages
         if callable(apply_chat_template):
             try:
-                return apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                return apply_chat_template(template_messages, tools=tools, tokenize=False, add_generation_prompt=True)
             except Exception:
                 pass
 
         rendered: list[str] = []
-        for message in messages:
+        for message in template_messages:
             role = str(message.get("role", "user"))
             content = str(message.get("content", ""))
             if role == "system":
@@ -858,7 +859,7 @@ class MlxVlmDiffusionGemmaBackend(WorkerBackend):
                 rendered.append(content)
         return "\n\n".join(part for part in rendered if part).strip()
 
-    def _prepare_request(self, messages: list[dict[str, Any]]) -> VlmPreparedRequest:
+    def _prepare_request(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> VlmPreparedRequest:
         prompt_messages: list[dict[str, Any]] = []
         image_paths: list[str] = []
         temp_dir: tempfile.TemporaryDirectory[str] | None = None
@@ -897,24 +898,34 @@ class MlxVlmDiffusionGemmaBackend(WorkerBackend):
             prompt_messages.append(next_message)
 
         return VlmPreparedRequest(
-            prompt=self._build_prompt(prompt_messages),
+            prompt=self._build_prompt(prompt_messages, tools=tools),
             image_paths=image_paths,
             audio_paths=[],
             temp_dir=temp_dir,
         )
 
-    def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
-        if tools:
-            raise RuntimeError("mlx_vlm_diffusion_tools_not_supported")
+    @staticmethod
+    def _tool_retry_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        retry_instruction = (
+            "Your previous tool-call output was malformed. Return exactly one valid Gemma tool call "
+            "using the declared tools. Do not answer in prose."
+        )
+        if messages and messages[0].get("role") in {"system", "developer"}:
+            patched = [dict(messages[0])]
+            patched[0]["content"] = f"{messages[0].get('content', '')}\n\n{retry_instruction}".strip()
+            patched.extend(messages[1:])
+            return patched
+        return [{"role": "system", "content": retry_instruction}, *messages]
 
-        effective_max_tokens = self._max_output_tokens
-        if isinstance(max_tokens, int) and max_tokens > 0:
-            effective_max_tokens = min(max_tokens, self._max_output_tokens)
-
-        prepared = self._prepare_request(messages)
-        generation_started = time.perf_counter()
+    def _generate_once(
+        self,
+        messages: list[dict[str, Any]],
+        effective_max_tokens: int,
+        tools: list[dict[str, Any]] | None,
+    ) -> Any:
+        prepared = self._prepare_request(messages, tools=tools)
         try:
-            response = self._generate(
+            return self._generate(
                 self._model,
                 self._processor,
                 prepared.prompt,
@@ -924,13 +935,31 @@ class MlxVlmDiffusionGemmaBackend(WorkerBackend):
                 **self._sampling_kwargs,
                 **self._diffusion_kwargs,
             )
-        except Exception as exc:  # pragma: no cover - depends on local runtime
-            raise RuntimeError(f"mlx_vlm_diffusion_generation_failed:{exc}") from exc
         finally:
             prepared.cleanup()
 
+    def _build_result(
+        self,
+        response: Any,
+        messages: list[dict[str, Any]],
+        started: float,
+        tools: list[dict[str, Any]] | None,
+        retry_count: int,
+    ) -> BackendResult:
         raw_content = response if isinstance(response, str) else getattr(response, "text", "")
         content = strip_channel_markup(str(raw_content or "")).strip()
+        content, finish_reason, tool_calls = parse_tool_calls(content)
+        malformed_tool_output = bool(tools and not tool_calls and _contains_tool_call_marker(str(raw_content or "")))
+        if malformed_tool_output:
+            raise RuntimeError("mlx_vlm_diffusion_malformed_tool_call")
+        if tool_calls:
+            tool_calls, hallucinated_names = filter_hallucinated_tool_calls(tool_calls, tools)
+            if not tool_calls and hallucinated_names:
+                content = f"[tool-call error] Model attempted unavailable tool(s): {', '.join(hallucinated_names)}"
+                finish_reason = "stop"
+            elif tool_calls:
+                finish_reason = "tool_calls"
+
         prompt_tokens = int(getattr(response, "prompt_tokens", 0) or 0)
         completion_tokens = int(getattr(response, "generation_tokens", 0) or 0)
         if prompt_tokens <= 0:
@@ -938,13 +967,14 @@ class MlxVlmDiffusionGemmaBackend(WorkerBackend):
         if completion_tokens <= 0:
             completion_tokens = max(1, len(content.split()))
 
-        total_ms = int((time.perf_counter() - generation_started) * 1000)
+        total_ms = int((time.perf_counter() - started) * 1000)
         load_ms = self._load_ms if not self._load_consumed else 0
         self._load_consumed = True
         peak_memory = getattr(response, "peak_memory", None)
+        first_visible_output_ms = total_ms if content or tool_calls else None
         return BackendResult(
             content=content,
-            finish_reason=str(getattr(response, "finish_reason", "stop") or "stop"),
+            finish_reason=finish_reason if tool_calls else str(getattr(response, "finish_reason", finish_reason) or finish_reason),
             usage={
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -955,14 +985,44 @@ class MlxVlmDiffusionGemmaBackend(WorkerBackend):
                 "load_ms": load_ms,
                 "prefill_ms": None,
                 "generation_ms": None,
+                "first_visible_output_ms": first_visible_output_ms,
                 "peak_memory_gb": float(peak_memory) if isinstance(peak_memory, (int, float)) else None,
                 "total_ms": total_ms,
+                "diffusion_canvas_tokens": int(getattr(response, "diffusion_canvas_tokens", 0) or 0),
+                "diffusion_denoising_steps": int(getattr(response, "diffusion_denoising_steps", 0) or 0),
+                "diffusion_work_tokens": int(getattr(response, "diffusion_work_tokens", 0) or 0),
+                "diffusion_canvas_tps": float(getattr(response, "diffusion_canvas_tps", 0.0) or 0.0),
+                "diffusion_work_tps": float(getattr(response, "diffusion_work_tps", 0.0) or 0.0),
+                "diffusion_tool_retry_count": retry_count,
             },
-            tool_calls=None,
+            tool_calls=tool_calls,
         )
 
+    def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
+        effective_max_tokens = self._max_output_tokens
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            effective_max_tokens = min(max_tokens, self._max_output_tokens)
+
+        generation_started = time.perf_counter()
+        try:
+            response = self._generate_once(messages, effective_max_tokens, tools)
+            try:
+                return self._build_result(response, messages, generation_started, tools, retry_count=0)
+            except RuntimeError as exc:
+                if str(exc) != "mlx_vlm_diffusion_malformed_tool_call" or not tools:
+                    raise
+                retry_response = self._generate_once(self._tool_retry_messages(messages), effective_max_tokens, tools)
+                return self._build_result(retry_response, messages, generation_started, tools, retry_count=1)
+        except Exception as exc:  # pragma: no cover - depends on local runtime
+            if isinstance(exc, RuntimeError) and str(exc).startswith("mlx_vlm_diffusion_"):
+                raise
+            raise RuntimeError(f"mlx_vlm_diffusion_generation_failed:{exc}") from exc
+
     def stream_generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None):
-        raise RuntimeError("mlx_vlm_diffusion_streaming_not_supported")
+        result = self.generate(messages, max_tokens, tools=tools)
+        if result.content and not result.tool_calls:
+            yield BackendStreamChunk(text=result.content)
+        yield result
 
 
 MlxBackend = MlxVlmTurboQuantBackend

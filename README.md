@@ -52,6 +52,7 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
 - **Operational visibility**
   - structured request and state-transition logs
   - timing metrics for load, prefill, generation, and total request time
+  - diffusion backends keep autoregressive-only timings nullable and report diffusion canvas/work counters separately
 - **Local testing tools**
   - smoke, recovery, timeout, fixture, soak, reclaim, and lane-comparison scripts
 - **Local-first security posture**
@@ -165,6 +166,22 @@ The service supports OpenAI-compatible tool calling. Pass a `tools` array in the
 The model responds with `finish_reason: "tool_calls"` and structured `tool_calls` in the message. Multi-turn tool-call conversations (where the assistant has prior `tool_calls` in history) are supported — the service decodes tool-call arguments before passing to the Gemma chat template.
 
 Hallucinated tool calls (calls to functions not declared in the `tools` array) are filtered out and surfaced as an error message in the response content.
+
+DiffusionGemma uses the same OpenAI-facing tool-call response shape as the TurboQuant lanes, but the worker obtains it by prompting the Gemma chat template and parsing the raw `mlx-vlm` output. Malformed diffusion tool-call output is treated as a retryable backend formatting failure instead of being returned as assistant prose.
+
+## Streaming and Metrics
+
+Autoregressive TurboQuant lanes stream incremental text tokens. DiffusionGemma denoises a canvas, so its streaming path emits only finalized output: one finalized content delta for normal text responses, or the final structured `tool_calls` delta for tool-use responses. It does not stream draft canvas text.
+
+For diffusion responses, `prefill_ms` and `generation_ms` remain `null` because those are autoregressive timing buckets. Diffusion-specific fields are reported in `metrics` when available from `mlx-vlm`:
+
+- `first_visible_output_ms`
+- `diffusion_canvas_tokens`
+- `diffusion_denoising_steps`
+- `diffusion_work_tokens`
+- `diffusion_canvas_tps`
+- `diffusion_work_tps`
+- `diffusion_tool_retry_count`
 
 ## Request Queue
 

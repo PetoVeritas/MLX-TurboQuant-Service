@@ -239,6 +239,11 @@ class BackendAdapterTests(unittest.TestCase):
             prompt_tokens = 5
             generation_tokens = 2
             peak_memory = 18.5
+            diffusion_canvas_tokens = 16
+            diffusion_denoising_steps = 48
+            diffusion_work_tokens = 768
+            diffusion_canvas_tps = 36.0
+            diffusion_work_tps = 1728.0
 
         def fake_generate(model, processor, prompt, **kwargs):
             captured["model"] = model
@@ -267,7 +272,14 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertEqual(result.metrics["load_ms"], 7)
         self.assertIsNone(result.metrics["prefill_ms"])
         self.assertIsNone(result.metrics["generation_ms"])
+        self.assertEqual(result.metrics["first_visible_output_ms"], result.metrics["total_ms"])
         self.assertEqual(result.metrics["peak_memory_gb"], 18.5)
+        self.assertEqual(result.metrics["diffusion_canvas_tokens"], 16)
+        self.assertEqual(result.metrics["diffusion_denoising_steps"], 48)
+        self.assertEqual(result.metrics["diffusion_work_tokens"], 768)
+        self.assertEqual(result.metrics["diffusion_canvas_tps"], 36.0)
+        self.assertEqual(result.metrics["diffusion_work_tps"], 1728.0)
+        self.assertEqual(result.metrics["diffusion_tool_retry_count"], 0)
         self.assertEqual(captured["prompt"], "<|image|>\ndescribe this")
         self.assertEqual(captured["image_bytes"], [b"a"])
         self.assertEqual(len(captured["image"]), 1)
@@ -313,18 +325,127 @@ class BackendAdapterTests(unittest.TestCase):
             },
         )
 
-    def test_vlm_diffusion_gemma_rejects_tools_and_streaming_for_now(self):
+    def test_vlm_diffusion_gemma_passes_tools_to_chat_template_and_decodes_prior_args(self):
         backend = MlxVlmDiffusionGemmaBackend.__new__(MlxVlmDiffusionGemmaBackend)
+        captured: dict[str, Any] = {}
 
-        with self.assertRaisesRegex(RuntimeError, "tools_not_supported"):
-            backend.generate(
-                [{"role": "user", "content": "hello"}],
-                max_tokens=8,
-                tools=[{"type": "function", "function": {"name": "lookup"}}],
-            )
+        class FakeTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                captured["messages"] = messages
+                captured["tools"] = kwargs.get("tools")
+                captured["tokenize"] = kwargs.get("tokenize")
+                captured["add_generation_prompt"] = kwargs.get("add_generation_prompt")
+                return "diffusion templated prompt"
 
-        with self.assertRaisesRegex(RuntimeError, "streaming_not_supported"):
-            list(backend.stream_generate([{"role": "user", "content": "hello"}], max_tokens=8))
+        backend._processor = type("Processor", (), {"tokenizer": FakeTokenizer()})()
+        tools = [{"type": "function", "function": {"name": "search_notes", "parameters": {"type": "object", "properties": {}}}}]
+        messages = [
+            {"role": "user", "content": "search notes"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "search_notes", "arguments": "{\"query\":\"DiffusionGemma OptIQ memory numbers\"}"},
+                    }
+                ],
+            },
+        ]
+
+        prompt = backend._build_prompt(messages, tools=tools)
+
+        self.assertEqual(prompt, "diffusion templated prompt")
+        self.assertIs(captured["tools"], tools)
+        self.assertFalse(captured["tokenize"])
+        self.assertTrue(captured["add_generation_prompt"])
+        self.assertEqual(
+            captured["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            {"query": "DiffusionGemma OptIQ memory numbers"},
+        )
+
+    def test_vlm_diffusion_gemma_returns_openai_tool_calls_from_gemma_output(self):
+        backend = MlxVlmDiffusionGemmaBackend.__new__(MlxVlmDiffusionGemmaBackend)
+        backend._model = object()
+        backend._processor = object()
+        backend._max_output_tokens = 64
+        backend._sampling_kwargs = {}
+        backend._diffusion_kwargs = {}
+        backend._load_ms = 0
+        backend._load_consumed = False
+        backend._generate = lambda *args, **kwargs: '<|tool_call>call:search_notes{query:<|"|>DiffusionGemma OptIQ memory numbers<|"|>}<tool_call|>'
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_notes",
+                    "description": "Search local notes",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }
+        ]
+
+        result = backend.generate([{"role": "user", "content": "search notes"}], max_tokens=16, tools=tools)
+
+        self.assertEqual(result.finish_reason, "tool_calls")
+        self.assertEqual(result.content, "")
+        self.assertIsNotNone(result.tool_calls)
+        self.assertEqual(result.tool_calls[0]["function"]["name"], "search_notes")
+        self.assertEqual(json.loads(result.tool_calls[0]["function"]["arguments"]), {"query": "DiffusionGemma OptIQ memory numbers"})
+
+    def test_vlm_diffusion_gemma_retries_malformed_tool_call_once(self):
+        backend = MlxVlmDiffusionGemmaBackend.__new__(MlxVlmDiffusionGemmaBackend)
+        backend._model = object()
+        backend._processor = object()
+        backend._max_output_tokens = 64
+        backend._sampling_kwargs = {}
+        backend._diffusion_kwargs = {}
+        backend._load_ms = 0
+        backend._load_consumed = False
+        prompts: list[str] = []
+        responses = iter(
+            [
+                "<|tool_call>call:search_notes{query:",
+                'call:search_notes{query:<|"|>DiffusionGemma OptIQ memory numbers<|"|>}',
+            ]
+        )
+
+        def fake_generate(_model, _processor, prompt, **_kwargs):
+            prompts.append(prompt)
+            return next(responses)
+
+        backend._generate = fake_generate
+        tools = [{"type": "function", "function": {"name": "search_notes", "parameters": {"type": "object", "properties": {}}}}]
+
+        result = backend.generate([{"role": "user", "content": "search notes"}], max_tokens=16, tools=tools)
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("previous tool-call output was malformed", prompts[1])
+        self.assertEqual(result.finish_reason, "tool_calls")
+        self.assertEqual(result.metrics["diffusion_tool_retry_count"], 1)
+        self.assertEqual(json.loads(result.tool_calls[0]["function"]["arguments"]), {"query": "DiffusionGemma OptIQ memory numbers"})
+
+    def test_vlm_diffusion_gemma_streams_finalized_content_only(self):
+        backend = MlxVlmDiffusionGemmaBackend.__new__(MlxVlmDiffusionGemmaBackend)
+        backend._model = object()
+        backend._processor = object()
+        backend._max_output_tokens = 64
+        backend._sampling_kwargs = {}
+        backend._diffusion_kwargs = {}
+        backend._load_ms = 0
+        backend._load_consumed = False
+        backend._generate = lambda *args, **kwargs: "final diffusion answer"
+
+        events = list(backend.stream_generate([{"role": "user", "content": "hello"}], max_tokens=8))
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].text, "final diffusion answer")
+        self.assertEqual(events[1].content, "final diffusion answer")
 
     def test_vlm_turboquant_passes_tools_to_chat_template_and_decodes_prior_tool_args(self):
         backend = MlxVlmTurboQuantBackend.__new__(MlxVlmTurboQuantBackend)
