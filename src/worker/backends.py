@@ -745,6 +745,226 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
         )
 
 
+_DIFFUSION_KWARG_KEYS = (
+    "max_denoising_steps",
+    "diffusion_full_canvas",
+    "diffusion_min_canvas_length",
+    "diffusion_max_canvas_length",
+    "diffusion_sampler",
+    "threshold",
+    "min_threshold",
+    "block_length",
+    "num_to_transfer",
+    "max_transfer_per_step",
+    "editing_threshold",
+    "max_post_steps",
+    "stability_steps",
+)
+
+
+class MlxVlmDiffusionGemmaBackend(WorkerBackend):
+    name = "mlx_vlm_diffusion_gemma"
+    backend_id = "mlx_vlm_diffusion_gemma"
+    supported_modality_set = BACKEND_ADAPTERS["mlx_vlm_diffusion_gemma"].supported_modalities
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self._config = config
+        raw_model_path = str(self._config.get("model", {}).get("path", "")).strip()
+        self._model_path = str(Path(raw_model_path).expanduser()) if raw_model_path else ""
+        if not self._model_path:
+            raise RuntimeError("mlx_vlm_diffusion_model_path_not_configured")
+        if not Path(self._model_path).exists():
+            raise RuntimeError(f"mlx_vlm_diffusion_model_path_missing:{self._model_path}")
+
+        try:
+            from mlx_vlm import generate, load  # type: ignore
+            from mlx_vlm.generate.diffusion import is_diffusion_model  # type: ignore
+        except Exception as exc:  # pragma: no cover - depends on local runtime
+            raise RuntimeError(f"mlx_vlm_diffusion_runtime_import_failed:{exc}") from exc
+
+        self._generate = generate
+        self._is_diffusion_model = is_diffusion_model
+        self._max_output_tokens = int(self._config.get("model", {}).get("maxOutputTokens", 1024) or 1024)
+        sampling_cfg = self._config.get("model", {}).get("sampling", {})
+        self._sampling_kwargs = MlxVlmTurboQuantBackend._generation_sampling_kwargs(sampling_cfg if isinstance(sampling_cfg, dict) else {})
+        self._diffusion_kwargs = self._generation_diffusion_kwargs()
+        self._load_ms = 0
+        self._load_consumed = False
+
+        load_started = time.perf_counter()
+        try:
+            self._model, self._processor = load(self._model_path, lazy=False)
+        except Exception as exc:  # pragma: no cover - depends on local runtime
+            raise RuntimeError(f"mlx_vlm_diffusion_model_load_failed:{exc}") from exc
+        self._load_ms = int((time.perf_counter() - load_started) * 1000)
+
+        model_type = str(getattr(getattr(self._model, "config", None), "model_type", "") or "")
+        if model_type != "diffusion_gemma":
+            raise RuntimeError(f"mlx_vlm_diffusion_unsupported_model_type:{model_type or 'unknown'}")
+        if not self._is_diffusion_model(self._model):
+            raise RuntimeError("mlx_vlm_diffusion_missing_canvas_config")
+
+    def _generation_diffusion_kwargs(self) -> dict[str, Any]:
+        diffusion_cfg: dict[str, Any] = {}
+        model_diffusion = self._config.get("model", {}).get("diffusion", {})
+        worker_diffusion = self._config.get("worker", {}).get("diffusion", {})
+        if isinstance(model_diffusion, dict):
+            diffusion_cfg.update(model_diffusion)
+        if isinstance(worker_diffusion, dict):
+            diffusion_cfg.update(worker_diffusion)
+
+        kwargs: dict[str, Any] = {}
+        for key in _DIFFUSION_KWARG_KEYS:
+            if key not in diffusion_cfg:
+                continue
+            value = diffusion_cfg[key]
+            if value is None:
+                continue
+            if key == "diffusion_full_canvas":
+                kwargs[key] = bool(value)
+            elif key == "threshold":
+                kwargs["diffusion_threshold"] = value
+            else:
+                kwargs[key] = value
+        return kwargs
+
+    def supported_modalities(self) -> set[str]:
+        config = getattr(getattr(self._model, "config", None), "__dict__", None)
+        if not isinstance(config, dict):
+            return set(self.supported_modality_set)
+        supported = {"text"}
+        if config.get("vision_config") is not None:
+            supported.add("image")
+        return supported & set(self.supported_modality_set)
+
+    def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
+        apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+        if callable(apply_chat_template):
+            try:
+                return apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                pass
+
+        rendered: list[str] = []
+        for message in messages:
+            role = str(message.get("role", "user"))
+            content = str(message.get("content", ""))
+            if role == "system":
+                rendered.append(content)
+            elif role == "assistant":
+                rendered.append(f"Assistant: {content}")
+            else:
+                rendered.append(content)
+        return "\n\n".join(part for part in rendered if part).strip()
+
+    def _prepare_request(self, messages: list[dict[str, Any]]) -> VlmPreparedRequest:
+        prompt_messages: list[dict[str, Any]] = []
+        image_paths: list[str] = []
+        temp_dir: tempfile.TemporaryDirectory[str] | None = None
+
+        for message in messages:
+            next_message = dict(message)
+            parts = message.get("parts")
+            if isinstance(parts, list):
+                text_parts: list[str] = []
+                image_placeholders: list[str] = []
+                for part in parts:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = str(part.get("type", ""))
+                    if part_type == "text":
+                        text = part.get("text")
+                        if isinstance(text, str) and text:
+                            text_parts.append(text)
+                        continue
+                    if part_type != "image":
+                        continue
+                    data_url = part.get("data_url")
+                    mime_type = str(part.get("mime_type", ""))
+                    if not isinstance(data_url, str):
+                        raise RuntimeError("mlx_vlm_diffusion_image_missing_data_url")
+                    if temp_dir is None:
+                        temp_dir = tempfile.TemporaryDirectory(prefix="mlx-vlm-diffusion-input-")
+                    suffix = MlxVlmTurboQuantBackend._media_suffix(mime_type, "image")
+                    payload = MlxVlmTurboQuantBackend._decode_data_url(data_url)
+                    media_path = Path(temp_dir.name) / f"image-{len(image_paths)}{suffix}"
+                    media_path.write_bytes(payload)
+                    image_paths.append(str(media_path))
+                    image_placeholders.append("<|image|>")
+                content_parts = [*image_placeholders, *text_parts]
+                next_message["content"] = "\n".join(content_parts) if content_parts else str(message.get("content", ""))
+            prompt_messages.append(next_message)
+
+        return VlmPreparedRequest(
+            prompt=self._build_prompt(prompt_messages),
+            image_paths=image_paths,
+            audio_paths=[],
+            temp_dir=temp_dir,
+        )
+
+    def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
+        if tools:
+            raise RuntimeError("mlx_vlm_diffusion_tools_not_supported")
+
+        effective_max_tokens = self._max_output_tokens
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            effective_max_tokens = min(max_tokens, self._max_output_tokens)
+
+        prepared = self._prepare_request(messages)
+        generation_started = time.perf_counter()
+        try:
+            response = self._generate(
+                self._model,
+                self._processor,
+                prepared.prompt,
+                image=prepared.image_paths or None,
+                max_tokens=effective_max_tokens,
+                verbose=False,
+                **self._sampling_kwargs,
+                **self._diffusion_kwargs,
+            )
+        except Exception as exc:  # pragma: no cover - depends on local runtime
+            raise RuntimeError(f"mlx_vlm_diffusion_generation_failed:{exc}") from exc
+        finally:
+            prepared.cleanup()
+
+        raw_content = response if isinstance(response, str) else getattr(response, "text", "")
+        content = strip_channel_markup(str(raw_content or "")).strip()
+        prompt_tokens = int(getattr(response, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(response, "generation_tokens", 0) or 0)
+        if prompt_tokens <= 0:
+            prompt_tokens = max(1, sum(len(str(m.get("content", "")).split()) for m in messages))
+        if completion_tokens <= 0:
+            completion_tokens = max(1, len(content.split()))
+
+        total_ms = int((time.perf_counter() - generation_started) * 1000)
+        load_ms = self._load_ms if not self._load_consumed else 0
+        self._load_consumed = True
+        peak_memory = getattr(response, "peak_memory", None)
+        return BackendResult(
+            content=content,
+            finish_reason=str(getattr(response, "finish_reason", "stop") or "stop"),
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+            metrics={
+                "queue_wait_ms": 0,
+                "load_ms": load_ms,
+                "prefill_ms": None,
+                "generation_ms": None,
+                "peak_memory_gb": float(peak_memory) if isinstance(peak_memory, (int, float)) else None,
+                "total_ms": total_ms,
+            },
+            tool_calls=None,
+        )
+
+    def stream_generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None):
+        raise RuntimeError("mlx_vlm_diffusion_streaming_not_supported")
+
+
 MlxBackend = MlxVlmTurboQuantBackend
 
 
@@ -755,4 +975,6 @@ def build_backend(config: dict[str, Any]) -> WorkerBackend:
     descriptor = backend_descriptor(config)
     if descriptor.backend_id == "mlx_vlm_turboquant":
         return MlxVlmTurboQuantBackend(config)
+    if descriptor.backend_id == "mlx_vlm_diffusion_gemma":
+        return MlxVlmDiffusionGemmaBackend(config)
     raise RuntimeError(f"unknown_backend_adapter:{configured_backend_id(config)}")

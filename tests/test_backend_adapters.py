@@ -8,7 +8,7 @@ from typing import Any
 
 from shared.backend_adapters import backend_descriptor, backend_supported_modalities, configured_backend_id
 from shared.parts import modalities_status
-from worker.backends import BackendResult, MlxVlmTurboQuantBackend, StubBackend
+from worker.backends import BackendResult, MlxVlmDiffusionGemmaBackend, MlxVlmTurboQuantBackend, StubBackend
 from worker.main import handle_generate
 
 
@@ -66,6 +66,7 @@ class BackendAdapterTests(unittest.TestCase):
     def test_backend_classes_declare_capabilities(self):
         self.assertEqual(StubBackend.supported_modalities_for_config(), {"text"})
         self.assertEqual(MlxVlmTurboQuantBackend.supported_modalities_for_config(), {"text", "image", "audio"})
+        self.assertEqual(MlxVlmDiffusionGemmaBackend.supported_modalities_for_config(), {"text", "image"})
 
     def test_turboquant_capabilities_follow_model_config_when_available(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,6 +216,115 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertEqual(result.content, "plain string answer")
         self.assertEqual(result.usage, {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5})
         self.assertEqual(result.finish_reason, "stop")
+
+    def test_vlm_diffusion_gemma_maps_diffusion_knobs_and_materializes_images(self):
+        backend = MlxVlmDiffusionGemmaBackend.__new__(MlxVlmDiffusionGemmaBackend)
+        backend._model = object()
+        backend._processor = object()
+        backend._max_output_tokens = 64
+        backend._sampling_kwargs = {"temperature": 0.0, "top_p": 0.95}
+        backend._diffusion_kwargs = {
+            "max_denoising_steps": 48,
+            "diffusion_sampler": "confidence-threshold",
+            "diffusion_threshold": 0.9,
+            "stability_steps": 2,
+        }
+        backend._load_ms = 7
+        backend._load_consumed = False
+        captured: dict[str, Any] = {}
+
+        class FakeResponse:
+            text = "<|channel|>final diffusion answer"
+            finish_reason = "stop"
+            prompt_tokens = 5
+            generation_tokens = 2
+            peak_memory = 18.5
+
+        def fake_generate(model, processor, prompt, **kwargs):
+            captured["model"] = model
+            captured["processor"] = processor
+            captured["prompt"] = prompt
+            captured.update(kwargs)
+            captured["image_bytes"] = [Path(path).read_bytes() for path in captured["image"]]
+            return FakeResponse()
+
+        backend._generate = fake_generate
+        messages = [
+            {
+                "role": "user",
+                "content": "describe this",
+                "parts": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image", "data_url": IMAGE_DATA_URL, "mime_type": "image/png", "byte_length": 1},
+                ],
+            }
+        ]
+
+        result = backend.generate(messages, max_tokens=12)
+
+        self.assertEqual(result.content, "diffusion answer")
+        self.assertEqual(result.usage, {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})
+        self.assertEqual(result.metrics["load_ms"], 7)
+        self.assertIsNone(result.metrics["prefill_ms"])
+        self.assertIsNone(result.metrics["generation_ms"])
+        self.assertEqual(result.metrics["peak_memory_gb"], 18.5)
+        self.assertEqual(captured["prompt"], "<|image|>\ndescribe this")
+        self.assertEqual(captured["image_bytes"], [b"a"])
+        self.assertEqual(len(captured["image"]), 1)
+        self.assertEqual(captured["max_tokens"], 12)
+        self.assertEqual(captured["temperature"], 0.0)
+        self.assertEqual(captured["top_p"], 0.95)
+        self.assertEqual(captured["max_denoising_steps"], 48)
+        self.assertEqual(captured["diffusion_sampler"], "confidence-threshold")
+        self.assertEqual(captured["diffusion_threshold"], 0.9)
+        self.assertEqual(captured["stability_steps"], 2)
+
+    def test_vlm_diffusion_gemma_config_merges_diffusion_kwargs(self):
+        backend = MlxVlmDiffusionGemmaBackend.__new__(MlxVlmDiffusionGemmaBackend)
+        backend._config = {
+            "model": {
+                "diffusion": {
+                    "max_denoising_steps": 48,
+                    "diffusion_full_canvas": False,
+                    "diffusion_sampler": "entropy-bound",
+                    "threshold": None,
+                    "block_length": 64,
+                    "unknown": "ignored",
+                }
+            },
+            "worker": {
+                "diffusion": {
+                    "diffusion_sampler": "confidence-threshold",
+                    "threshold": 0.9,
+                    "stability_steps": 2,
+                }
+            },
+        }
+
+        self.assertEqual(
+            backend._generation_diffusion_kwargs(),
+            {
+                "max_denoising_steps": 48,
+                "diffusion_full_canvas": False,
+                "diffusion_sampler": "confidence-threshold",
+                "diffusion_threshold": 0.9,
+                "block_length": 64,
+                "stability_steps": 2,
+            },
+        )
+
+    def test_vlm_diffusion_gemma_rejects_tools_and_streaming_for_now(self):
+        backend = MlxVlmDiffusionGemmaBackend.__new__(MlxVlmDiffusionGemmaBackend)
+
+        with self.assertRaisesRegex(RuntimeError, "tools_not_supported"):
+            backend.generate(
+                [{"role": "user", "content": "hello"}],
+                max_tokens=8,
+                tools=[{"type": "function", "function": {"name": "lookup"}}],
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "streaming_not_supported"):
+            list(backend.stream_generate([{"role": "user", "content": "hello"}], max_tokens=8))
 
     def test_vlm_turboquant_passes_tools_to_chat_template_and_decodes_prior_tool_args(self):
         backend = MlxVlmTurboQuantBackend.__new__(MlxVlmTurboQuantBackend)
