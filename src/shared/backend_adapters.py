@@ -10,6 +10,7 @@ from typing import Any
 
 TEXT_MODALITIES = frozenset({"text"})
 TURBOQUANT_RUNTIME_MODALITIES = frozenset({"text", "image", "audio"})
+DIFFUSION_GEMMA_RUNTIME_MODALITIES = frozenset({"text", "image"})
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,11 @@ BACKEND_ADAPTERS: dict[str, BackendAdapterDescriptor] = {
         "mlx_vlm_turboquant",
         "MLX-VLM TurboQuant backend",
         TURBOQUANT_RUNTIME_MODALITIES,
+    ),
+    "mlx_vlm_diffusion_gemma": BackendAdapterDescriptor(
+        "mlx_vlm_diffusion_gemma",
+        "MLX-VLM DiffusionGemma backend",
+        DIFFUSION_GEMMA_RUNTIME_MODALITIES,
     ),
 }
 

@@ -42,6 +42,20 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertEqual(backend_descriptor(cfg).backend_id, "mlx_vlm_turboquant")
         self.assertEqual(backend_supported_modalities(cfg), {"text", "image", "audio"})
 
+    def test_diffusion_gemma_backend_selects_new_descriptor_only(self):
+        cfg = config(backend="mlx_vlm_diffusion_gemma", image=True, audio=True)
+
+        descriptor = backend_descriptor(cfg)
+        status = modalities_status(cfg)
+
+        self.assertEqual(configured_backend_id(cfg), "mlx_vlm_diffusion_gemma")
+        self.assertEqual(descriptor.backend_id, "mlx_vlm_diffusion_gemma")
+        self.assertEqual(descriptor.display_name, "MLX-VLM DiffusionGemma backend")
+        self.assertEqual(backend_supported_modalities(cfg), {"text", "image"})
+        self.assertEqual(status["configured"], ["audio", "image", "text"])
+        self.assertEqual(status["backend_supported"], ["image", "text"])
+        self.assertEqual(status["effective"], ["image", "text"])
+
     def test_stub_mode_overrides_backend_selection(self):
         cfg = config(backend="mlx_vlm_turboquant", stub_mode=True)
 
