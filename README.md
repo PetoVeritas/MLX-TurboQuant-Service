@@ -6,15 +6,7 @@ The primary lane is the **Gemma 4 26B-A4B** TurboQuant model — the flagship, h
 
 The backend is **`mlx-vlm`** (with a vendored elastic-KV patch for Gemma 4 E2B/E4B TurboQuant models). It supports **text, image, and audio** modalities with **tool calling** (OpenAI-compatible `tools` parameter). Model support depends on the artifact: 26B TurboQuant supports text+image; E2B TurboQuant supports text+image+audio.
 
-## Current Production Lanes
-
-| Port | Model | Quant | Context | Modalities | Priority |
-|------|-------|-------|---------|------------|----------|
-| 4017 | Gemma 4 26B A4B IT | TurboQuant 8-bit | 73728 | image, text | 1 |
-| 4018 | Gemma 4 E2B IT | TurboQuant 4-bit | 73728 | audio, image, text | 2 |
-| 4019 | Gemma 4 E2B IT | TurboQuant 4-bit | 16384 | audio, image, text | 3 |
-
-All three lanes use the same `mlx-vlm` runtime with the elastic-KV patch. 4018 and 4019 run separate instances of the same E2B weights at different context windows.
+The harness also supports a **DiffusionGemma** backend (discrete-diffusion Gemma 4 26B-A4B) as a sibling to the autoregressive TurboQuant backends, sharing the same supervisor/worker lifecycle, OpenAI-compatible API, and tool-call response shape. See the **DiffusionGemma** sections below for its streaming and metrics differences.
 
 ## Why this exists
 
