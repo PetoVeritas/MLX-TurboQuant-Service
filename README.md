@@ -135,8 +135,8 @@ Recommended local shape (based on actual memory measurements):
 
 - 26B lane: `rssEstimateLoadedGb: 29.0` (actual peak ~28.9 GB), `priority: 1`
 - E2B lane: `rssEstimateLoadedGb: 6.0` (actual peak ~4.4 GB), `priority: 2` or `3`
-- Portable default ceiling: `ceilingGb: 34.0` (conservative on 48 GB machines)
-- Mauricio's tuned 48 GB machine values: main TurboQuant `ceilingGb: 36.0`; DiffusionGemma 4020 `ceilingGb: 37.0` with `rssEstimateLoadedGb: 22.0`; see `config/diffusiongemma-4020.example.json`
+- Portable default ceiling: `ceilingGb: 34.0` (conservative; safe on a 48 GB box)
+- Machines with more headroom can raise the ceiling and per-lane estimates in a local profile; see `config/diffusiongemma-4020.example.json` for a worked DiffusionGemma 4020 example. Tune these to your own hardware — they are machine-specific, not harness defaults.
 - Keep `allowLowerPriorityToPreemptHigher: false` so E2B lanes cannot preempt 26B by default
 
 When a cold load would exceed the ceiling, the governor refuses admission with `governor_refused` unless a configured preemption path can safely unload lower-priority rows first.

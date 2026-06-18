@@ -159,9 +159,9 @@ Then edit `config/local.json`. At minimum, set:
 }
 ```
 
-The shared default ceiling is intentionally conservative and portable. Mauricio's 48 GB production machine currently uses a local override of `ceilingGb: 36.0` for the main TurboQuant lane.
+The shared default ceiling is intentionally conservative and portable. A machine with more RAM headroom can raise it via a local override (for example, `ceilingGb: 36.0` on a 48 GB box) for the main TurboQuant lane.
 
-DiffusionGemma 4020 uses a separate local profile. Start from `config/diffusiongemma-4020.example.json` and set the real `model.path` plus `worker.pythonExecutable`. Its Mauricio-machine values are `contextWindowTokens: 64000`, `maxOutputTokens: 4096`, `diffusion_sampler: "entropy-bound"`, `prefill_step_size: 2048`, `rssEstimateLoadedGb: 22.0`, and `ceilingGb: 37.0`.
+DiffusionGemma 4020 uses a separate local profile. Start from `config/diffusiongemma-4020.example.json` and set the real `model.path` plus `worker.pythonExecutable`. The example profile's worked values are `contextWindowTokens: 64000`, `maxOutputTokens: 4096`, `diffusion_sampler: "entropy-bound"`, `prefill_step_size: 2048`, `rssEstimateLoadedGb: 22.0`, and `ceilingGb: 37.0` — tune these to your own hardware.
 
 Important fields:
 - `model.id`: model name exposed to clients
