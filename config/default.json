@@ -11,6 +11,11 @@
     "sampling": {
       "temperature": 0.7,
       "topP": 0.9
+    },
+    "diffusion": {
+      "max_denoising_steps": 48,
+      "diffusion_sampler": "entropy-bound",
+      "prefill_step_size": 2048
     }
   },
   "modalities": {

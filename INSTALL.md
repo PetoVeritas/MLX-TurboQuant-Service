@@ -61,7 +61,15 @@ pip install --upgrade pip
 pip install mlx-vlm==0.6.3
 ```
 
-The service is tested with `mlx-vlm==0.6.3` and `mlx==0.31.2`. Later versions may work but require retesting the elastic-KV patch.
+The TurboQuant lanes are tested with `mlx-vlm==0.6.3` and `mlx==0.31.2`. Later versions may work but require retesting the elastic-KV patch.
+
+For the production DiffusionGemma lane, install the pinned upstream `mlx-vlm` revision instead of the PyPI wheel:
+
+```bash
+pip install "git+https://github.com/Blaizzy/mlx-vlm.git@a0578772e92409be880543c1d26d04fd00d840dc"
+```
+
+That upstream revision still reports package version `0.6.3`, but it includes native DiffusionGemma chunked prefill (`prefill_step_size` plus the model `chunked_prefill_policy`). Reinstalling plain PyPI `mlx-vlm==0.6.3` over the DiffusionGemma runtime can silently restore the old dense-mask OOM path.
 
 ### Apply the elastic-KV patch
 
@@ -78,7 +86,22 @@ Verify the patch applied:
 ../../../../../scripts/verify-mlx-vlm-turboquant-patch.sh
 ```
 
-**Every `mlx-vlm` upgrade must retest against E2B/E4B/26B load matrix.** The patch is version-specific.
+For DiffusionGemma, verify native chunked prefill exists:
+
+```bash
+python - <<'PY'
+import inspect
+import mlx_vlm.generate.diffusion as diffusion
+from mlx_vlm.models.diffusion_gemma.language import LanguageModel
+
+print("prefill_step_size" in inspect.signature(diffusion.stream_diffusion_generate).parameters)
+print(hasattr(LanguageModel, "chunked_prefill_policy"))
+PY
+```
+
+Both lines must print `True` before using the 4020 lane for long agent prompts.
+
+**Every `mlx-vlm` upgrade must retest against E2B/E4B/26B load matrix and the DiffusionGemma long-prompt prefill probe.** The patch/pin is version-specific.
 
 ## 3. Download the model
 
@@ -135,6 +158,10 @@ Then edit `config/local.json`. At minimum, set:
   }
 }
 ```
+
+The shared default ceiling is intentionally conservative and portable. Mauricio's 48 GB production machine currently uses a local override of `ceilingGb: 36.0` for the main TurboQuant lane.
+
+DiffusionGemma 4020 uses a separate local profile. Start from `config/diffusiongemma-4020.example.json` and set the real `model.path` plus `worker.pythonExecutable`. Its Mauricio-machine values are `contextWindowTokens: 64000`, `maxOutputTokens: 4096`, `diffusion_sampler: "entropy-bound"`, `prefill_step_size: 2048`, `rssEstimateLoadedGb: 22.0`, and `ceilingGb: 37.0`.
 
 Important fields:
 - `model.id`: model name exposed to clients
@@ -216,7 +243,7 @@ Set `model.path` in `config/local.json`.
 The configured model path does not exist on disk. Check the absolute path and that the model download completed fully.
 
 ### `mlx_runtime_import_failed:...`
-The worker Python environment does not have a working `mlx-vlm` install. Confirm `worker.pythonExecutable` points at the right venv and re-run `pip install mlx-vlm==0.6.3` inside it. Make sure the elastic-KV patch is applied (see step 2).
+The worker Python environment does not have a working `mlx-vlm` install. Confirm `worker.pythonExecutable` points at the right venv, then reinstall the runtime dependency for the lane: PyPI `mlx-vlm==0.6.3` plus the elastic-KV patch for TurboQuant, or pinned upstream commit `a0578772e92409be880543c1d26d04fd00d840dc` for DiffusionGemma. Make sure the applicable patch/pin checks from step 2 pass.
 
 ### Service starts but `/ready` is not OK
 Check in this order:
@@ -250,6 +277,7 @@ The model repo is gated. Run `huggingface-cli login`, accept the license on the 
 
 The repository is enough to share the app itself, but a fresh machine still needs:
 - a local worker virtualenv with `mlx-vlm==0.6.3` and the elastic-KV patch applied
+- for DiffusionGemma, the pinned upstream `mlx-vlm` commit `a0578772e92409be880543c1d26d04fd00d840dc`
 - local model files
 - local config
 

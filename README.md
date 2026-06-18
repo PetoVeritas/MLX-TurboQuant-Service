@@ -135,12 +135,15 @@ Recommended local shape (based on actual memory measurements):
 
 - 26B lane: `rssEstimateLoadedGb: 29.0` (actual peak ~28.9 GB), `priority: 1`
 - E2B lane: `rssEstimateLoadedGb: 6.0` (actual peak ~4.4 GB), `priority: 2` or `3`
-- Shared ceiling: `ceilingGb: 34.0` (on 48 GB machines)
+- Portable default ceiling: `ceilingGb: 34.0` (conservative on 48 GB machines)
+- Mauricio's tuned 48 GB machine values: main TurboQuant `ceilingGb: 36.0`; DiffusionGemma 4020 `ceilingGb: 37.0` with `rssEstimateLoadedGb: 22.0`; see `config/diffusiongemma-4020.example.json`
 - Keep `allowLowerPriorityToPreemptHigher: false` so E2B lanes cannot preempt 26B by default
 
 When a cold load would exceed the ceiling, the governor refuses admission with `governor_refused` unless a configured preemption path can safely unload lower-priority rows first.
 
 Note: the 26B TurboQuant model uses ~29 GB at peak under `mlx-vlm`. Configuring the estimate at 20 GB (the `mlx-lm` baseline) causes incorrect admission decisions. Set it to at least 29 GB for accurate co-residency.
+
+DiffusionGemma's 4020 lane depends on native chunked prefill from pinned upstream `mlx-vlm` commit `a0578772e92409be880543c1d26d04fd00d840dc`. The safe harness-native diffusion defaults are `diffusion_sampler: "entropy-bound"` and `prefill_step_size: 2048`; `confidence-threshold` can lock tokens into repetition loops on large agent prompts, and PyPI `mlx-vlm==0.6.3` does not include the native chunked-prefill policy needed to avoid the old dense-mask OOM path.
 
 ## Tool Calling
 
@@ -184,11 +187,13 @@ The supervisor intentionally keeps inference single-worker and local-first. It c
 
 Queued requests wait for the active request to finish, then run through the same worker path. If the queue is already full, `POST /v1/chat/completions` returns `409 queue_full`.
 
-## Runtime Patch
+## Runtime Patches and Pins
 
 The service requires a patched `mlx-vlm` to load Gemma 4 E2B/E4B TurboQuant models. The patch fixes `mlx_vlm/models/gemma4/language.py` to allocate K/V modules for all layers (matching `mlx-lm`'s behavior) instead of skipping layers marked as KV-shared.
 
 The patch file is at `runtime-patches/mlx-vlm-0.6.3-gemma4-elastic-kv.patch`. It must be applied to the `mlx-vlm` package inside the worker virtualenv after installation. A verification script is provided at `scripts/verify-mlx-vlm-turboquant-patch.sh`.
+
+The production DiffusionGemma lane additionally requires `mlx-vlm` from pinned upstream commit `a0578772e92409be880543c1d26d04fd00d840dc` so `generate/diffusion.py`, `generate/common.py`, and `models/diffusion_gemma/language.py` expose native `prefill_step_size` chunking. A plain reinstall from PyPI `mlx-vlm==0.6.3` can silently remove that support even though the package metadata still reports `0.6.3`.
 
 **Every `mlx-vlm` upgrade must retest against E2B/E4B/26B load matrix.** The patch is version-specific and carries a maintenance burden.
 

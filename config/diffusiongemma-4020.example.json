@@ -1,0 +1,70 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 4020,
+    "adminLocalOnly": true
+  },
+  "model": {
+    "id": "diffusiongemma-local-mlx-26b-a4b-4bit",
+    "path": "/absolute/path/to/diffusiongemma-26b-a4b-4bit-mlx",
+    "contextWindowTokens": 64000,
+    "maxOutputTokens": 4096,
+    "sampling": {
+      "temperature": 0.0,
+      "topP": 0.95
+    },
+    "diffusion": {
+      "max_denoising_steps": 48,
+      "diffusion_sampler": "entropy-bound",
+      "prefill_step_size": 2048
+    }
+  },
+  "modalities": {
+    "text": {
+      "enabled": true
+    },
+    "image": {
+      "enabled": false
+    },
+    "video": {
+      "enabled": false
+    },
+    "audio": {
+      "enabled": false
+    },
+    "document": {
+      "enabled": false
+    },
+    "strictCapabilityCheck": true
+  },
+  "governor": {
+    "enabled": true,
+    "instanceId": "mlx-diffusiongemma-26b",
+    "priority": 2,
+    "rssEstimateLoadedGb": 22.0,
+    "stateDir": "~/Library/Application Support/MLX-TurboQuant-Governor",
+    "ceilingGb": 37.0,
+    "allowLowerPriorityToPreemptHigher": false,
+    "staleAfterSeconds": 900
+  },
+  "worker": {
+    "backend": "mlx_vlm_diffusion_gemma",
+    "startupTimeoutMs": 120000,
+    "requestTimeoutMs": 240000,
+    "probeTimeoutMs": 1000,
+    "pythonExecutable": "/absolute/path/to/runtime/mlx-python-runtime/.venv/bin/python",
+    "stubMode": false,
+    "lazyLoad": true,
+    "idleUnload": {
+      "enabled": true,
+      "idleMs": 300000
+    },
+    "recycle": {
+      "maxConsecutiveErrors": 3,
+      "cooldownMs": 15000
+    }
+  },
+  "logging": {
+    "level": "info"
+  }
+}
