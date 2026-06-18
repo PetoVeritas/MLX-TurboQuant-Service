@@ -751,6 +751,7 @@ _DIFFUSION_KWARG_KEYS = (
     "diffusion_min_canvas_length",
     "diffusion_max_canvas_length",
     "diffusion_sampler",
+    "prefill_step_size",
     "threshold",
     "min_threshold",
     "block_length",
