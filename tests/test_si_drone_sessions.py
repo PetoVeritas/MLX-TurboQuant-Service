@@ -221,6 +221,8 @@ class SiDroneSessionTests(unittest.TestCase):
         test_case = self
 
         class Tokenizer:
+            chat_template = "fake gemma4 template"
+
             def apply_chat_template(self, messages, *, tools=None, tokenize=False, add_generation_prompt=True):
                 test_case.assertIsNone(tools)
                 test_case.assertFalse(tokenize)
@@ -245,8 +247,25 @@ class SiDroneSessionTests(unittest.TestCase):
         self.assertFalse(prepared.add_special_tokens)
         self.assertEqual(len(prepared.audio_paths), 1)
 
+    def test_turboquant_session_parts_falls_back_when_template_method_has_no_template(self):
+        class Tokenizer:
+            chat_template = None
+
+            def apply_chat_template(self, messages, *, tools=None, tokenize=False, add_generation_prompt=True):
+                raise AssertionError("missing chat_template should force manual Gemma4 prompt")
+
+        backend = MlxVlmTurboQuantBackend.__new__(MlxVlmTurboQuantBackend)
+        backend._model = type("Model", (), {"config": type("Config", (), {"model_type": "gemma4"})()})()
+        backend._processor = Tokenizer()
+        prepared = backend._prepare_session_parts([{"type": "text", "text": "before"}], turn_index=1)
+
+        self.assertEqual(prepared.prompt, "<start_of_turn>user\nbefore<end_of_turn>\n<start_of_turn>model\n")
+        self.assertTrue(prepared.add_special_tokens)
+
     def test_turboquant_session_parts_append_followup_turn_as_gemma4_template_delta(self):
         class Tokenizer:
+            chat_template = "fake gemma4 template"
+
             def apply_chat_template(self, messages, *, tools=None, tokenize=False, add_generation_prompt=True):
                 content = messages[0]["content"]
                 return f"<bos><|turn>user\n{content}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"

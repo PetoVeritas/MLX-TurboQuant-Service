@@ -671,7 +671,7 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
 
     def _has_chat_template(self) -> bool:
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
-        return callable(getattr(tokenizer, "apply_chat_template", None))
+        return callable(getattr(tokenizer, "apply_chat_template", None)) and bool(getattr(tokenizer, "chat_template", None))
 
     @staticmethod
     def _message_text_content(message: dict[str, Any]) -> str:
