@@ -81,6 +81,7 @@ class WorkerManager:
         self._loaded = False
         self._accepting_requests = False
         self._queued_requests = 0
+        self._live_session_count = 0
         self._request_context = threading.local()
         self._cold_load_expected = False
         self._state = "not_loaded"
@@ -252,6 +253,14 @@ class WorkerManager:
     def model_id(self) -> str:
         return str(self._config.get("model", {}).get("id", ""))
 
+    def worker_pid(self) -> int | None:
+        with self._state_lock:
+            return self._worker_pid()
+
+    def set_live_session_count(self, count: int) -> None:
+        with self._state_lock:
+            self._live_session_count = max(0, int(count))
+
     def _worker_pid(self) -> int | None:
         if self._process and self._process.poll() is None:
             return self._process.pid
@@ -306,6 +315,8 @@ class WorkerManager:
         """
 
         if not self._idle_unload_enabled:
+            return False
+        if self._live_session_count > 0:
             return False
         if not self._loaded or not self._process or self._process.poll() is not None:
             return False
@@ -410,6 +421,7 @@ class WorkerManager:
                     "idle_seconds": self._idle_seconds_locked(),
                     "queue_depth": self._queued_requests,
                     "queue_max_depth": self._queue_max_depth,
+                    "live_session_count": self._live_session_count,
                 },
                 "modalities": modalities_status(self._config),
             }
@@ -436,6 +448,7 @@ class WorkerManager:
                     "stub_mode": bool(self._config.get("worker", {}).get("stubMode", False)),
                     "queue_depth": self._queued_requests,
                     "queue_max_depth": self._queue_max_depth,
+                    "live_session_count": self._live_session_count,
                 },
                 "metrics": dict(self._metrics),
                 "config": {
@@ -448,6 +461,7 @@ class WorkerManager:
                     "queue_max_depth": self._queue_max_depth,
                     "idle_unload_enabled": self._idle_unload_enabled,
                     "idle_unload_s": self._idle_unload_seconds,
+                    "live_session_count": self._live_session_count,
                 },
                 "governor": {
                     "enabled": self._governor.enabled,
@@ -958,6 +972,88 @@ class WorkerManager:
             metrics=dict(message.get("metrics", {})),
             tool_calls=message.get("tool_calls"),
         )
+
+    def generate_session_turn(
+        self,
+        session_id: str,
+        parts: list[dict[str, Any]],
+        *,
+        max_tokens: int | None,
+        policy: dict[str, Any],
+        turn_index: int,
+    ) -> CompletionResult:
+        with self._worker_lock:
+            try:
+                self._spawn_worker_if_needed()
+                with self._state_lock:
+                    if self._state != "busy":
+                        self._set_state("busy", accepting_requests=False, loaded=True, error=None)
+                    request_id = f"req_{next(self._request_counter)}_{uuid.uuid4().hex[:8]}"
+                    pid = self._worker_pid()
+                LOG.info(
+                    "worker_session_turn_start %s",
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "session_id": session_id,
+                            "pid": pid,
+                            "part_count": len(parts),
+                            "max_tokens": max_tokens,
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                self._send(
+                    {
+                        "command": "session_generate",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "parts": parts,
+                        "max_tokens": max_tokens,
+                        "policy": policy,
+                        "turn_index": turn_index,
+                    }
+                )
+                message = self._read_message(timeout_seconds=self._worker_request_timeout, timeout_metric="request_timeouts")
+            except TimeoutError:
+                with self._state_lock:
+                    self._terminate_process_locked(force=True)
+                raise
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                with self._state_lock:
+                    self._terminate_process_locked(force=True)
+                raise RuntimeError(f"{FAILURE_CRASH}:Worker session request crashed:{exc}") from exc
+
+        if message.get("type") == "error":
+            error = str(message.get("error", "worker_error"))
+            if error == "session_lost":
+                raise RuntimeError(f"{FAILURE_CRASH}:session_lost")
+            if error.startswith("unsupported_part_type:") or error.startswith("unsupported_backend:"):
+                raise RuntimeError(error)
+            raise RuntimeError(f"{FAILURE_BACKEND}:{error}")
+        if message.get("type") != "session_result":
+            raise RuntimeError(f"{FAILURE_PROTOCOL}:Unexpected worker response: {message}")
+
+        return CompletionResult(
+            content=str(message.get("content", "")),
+            finish_reason=str(message.get("finish_reason", "stop")),
+            usage=dict(message.get("usage", {})),
+            metrics=dict(message.get("metrics", {})),
+            tool_calls=None,
+        )
+
+    def teardown_session(self, session_id: str) -> None:
+        with self._worker_lock:
+            with self._state_lock:
+                if not self._process or self._process.poll() is not None:
+                    return
+            try:
+                self._send({"command": "session_teardown", "session_id": session_id})
+                self._read_message(timeout_seconds=2, timeout_metric="shutdown_timeouts")
+            except Exception:
+                LOG.warning("worker_session_teardown_failed %s", json.dumps({"session_id": session_id}, sort_keys=True))
 
     def generate_completion_stream(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None):
         # Note: _worker_lock is held across the full generation (including

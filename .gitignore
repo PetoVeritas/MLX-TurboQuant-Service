@@ -8,6 +8,7 @@ __pycache__/
 # Runtime / logs / scratch
 logs/
 tmp/
+.tmp/
 
 # Local config overrides (keep *.example.json checked in)
 config/local.json

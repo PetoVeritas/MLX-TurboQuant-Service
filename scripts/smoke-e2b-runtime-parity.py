@@ -94,6 +94,22 @@ def choice_text(payload: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
+def assert_not_degenerate(name: str, text: str, prompt: str) -> None:
+    normalized = text.strip()
+    if not normalized:
+        raise AssertionError(f"{name} smoke returned empty content")
+    if normalized == prompt.strip():
+        raise AssertionError(f"{name} smoke echoed the prompt verbatim: {text!r}")
+    tokens = normalized.split()
+    run_length = 1
+    previous: str | None = None
+    for token in tokens:
+        run_length = run_length + 1 if token == previous else 1
+        if run_length > 8:
+            raise AssertionError(f"{name} smoke repeated token {token!r} more than 8 times: {text!r}")
+        previous = token
+
+
 def assert_status(name: str, status: int, expected: int, payload: dict[str, Any]) -> None:
     if status != expected:
         raise AssertionError(f"{name}: expected HTTP {expected}, got {status}: {payload}")
@@ -273,13 +289,15 @@ def main() -> int:
             assert_status("models", models_status, 200, models)
             report["checks"]["models"] = models
 
+            text_prompt = "Reply with exactly: text smoke ok"
             text_status, text_response = chat_completion(
                 args.host,
                 args.port,
-                chat_payload(model_id, "Reply with exactly: text smoke ok", max_tokens=12),
+                chat_payload(model_id, text_prompt, max_tokens=12),
             )
             assert_status("text", text_status, 200, text_response)
             text = choice_text(text_response)
+            assert_not_degenerate("text", text, text_prompt)
             if "text smoke ok" not in text.lower():
                 raise AssertionError(f"text smoke unexpected content: {text!r}")
             report["checks"]["text"] = {
@@ -303,6 +321,7 @@ def main() -> int:
             )
             assert_status("image", image_status, 200, image_response)
             image_text = choice_text(image_response)
+            assert_not_degenerate("image", image_text, "What color is the box in this image? Answer in one word.")
             if "red" not in image_text.lower():
                 raise AssertionError(f"image smoke unexpected content: {image_text!r}")
             report["checks"]["image"] = {
@@ -326,6 +345,7 @@ def main() -> int:
             )
             assert_status("audio", audio_status, 200, audio_response)
             audio_text = choice_text(audio_response)
+            assert_not_degenerate("audio", audio_text, "Transcribe the spoken word in this audio. Answer with one word.")
             if "banana" not in audio_text.lower():
                 raise AssertionError(f"audio smoke unexpected content: {audio_text!r}")
             report["checks"]["audio"] = {

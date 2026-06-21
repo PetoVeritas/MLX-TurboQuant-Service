@@ -89,6 +89,14 @@
       "cooldownMs": 15000
     }
   },
+  "sessions": {
+    "ttl_s": 300,
+    "max_turns": 16,
+    "max_context_tokens": 20000,
+    "audio_seconds_per_turn": 15,
+    "onOverflow": "reject",
+    "reaperIntervalS": 5
+  },
   "logging": {
     "level": "info"
   }

@@ -7,11 +7,17 @@ import json
 import logging
 import time
 import uuid
+import base64
+import binascii
+import wave
+from io import BytesIO
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlparse
 
 from shared.config import load_config
 from shared.parts import MessagePartError, extract_message_parts, part_modalities, parts_to_dicts, text_from_parts, validate_part_counts
+from supervisor.session_store import SessionStore
 from supervisor.worker_manager import CompletionChunk, CompletionResult, FAILURE_BACKEND, FAILURE_COOLDOWN, FAILURE_CRASH, FAILURE_GOVERNOR, FAILURE_PROTOCOL, FAILURE_STARTUP, FAILURE_TIMEOUT, WorkerManager
 
 
@@ -35,7 +41,16 @@ class App:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         self.worker = WorkerManager(config)
+        self.sessions = SessionStore(
+            config,
+            on_count_change=self.worker.set_live_session_count,
+            on_expire=self.worker.teardown_session,
+        )
         self.version = "0.1.0"
+
+    def shutdown(self) -> None:
+        self.sessions.shutdown()
+        self.worker.shutdown()
 
 
 def configure_logging(config: dict[str, Any]) -> None:
@@ -51,6 +66,84 @@ def split_failure(error: str) -> tuple[str | None, str]:
     if prefix in {FAILURE_BACKEND, FAILURE_PROTOCOL, FAILURE_TIMEOUT, FAILURE_STARTUP, FAILURE_CRASH, FAILURE_GOVERNOR, "unsupported_modality"}:
         return prefix, remainder
     return None, error
+
+
+def _session_error_status(error_type: str) -> int:
+    if error_type == "session_not_found":
+        return 404
+    if error_type == "session_expired":
+        return 410
+    if error_type == "session_lost":
+        return 409
+    if error_type == "max_context_tokens_exceeded":
+        return 409
+    if error_type in {"max_turns_exceeded", "unsupported_part_type"}:
+        return 415 if error_type == "unsupported_part_type" else 409
+    return 400
+
+
+def _wav_duration_seconds(payload: bytes) -> float | None:
+    try:
+        with wave.open(BytesIO(payload), "rb") as handle:
+            frames = handle.getnframes()
+            rate = handle.getframerate()
+            if rate <= 0:
+                return None
+            return frames / float(rate)
+    except (wave.Error, EOFError):
+        return None
+
+
+def normalize_session_parts(payload: dict[str, Any], policy: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, tuple[int, str, str] | None]:
+    parts = payload.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return None, (400, "bad_request", "Field 'parts' must be a non-empty array")
+
+    normalized: list[dict[str, Any]] = []
+    audio_seconds_limit = int(policy["audio_seconds_per_turn"])
+    audio_seconds_total = 0.0
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            return None, (400, "bad_request", f"Part at index {index} must be an object")
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str):
+                return None, (400, "bad_request", f"Text part at index {index} must include string 'text'")
+            normalized.append({"type": "text", "text": text})
+            continue
+        if part_type in {"image", "video", "video_frames"}:
+            return None, (415, "unsupported_part_type", f"SI Drone v1 does not support part type: {part_type}")
+        if part_type != "audio":
+            return None, (400, "bad_request", f"Unsupported part type at index {index}: {part_type!r}")
+
+        audio = part.get("audio")
+        if not isinstance(audio, dict):
+            return None, (400, "bad_request", f"Audio part at index {index} must include an audio object")
+        audio_format = str(audio.get("format", "")).strip().lower()
+        if audio_format not in {"wav", "x-wav"}:
+            return None, (415, "unsupported_part_type", "SI Drone v1 audio input only supports wav")
+        data = audio.get("data")
+        if not isinstance(data, str) or not data:
+            return None, (400, "bad_request", f"Audio part at index {index} must include base64 data")
+        try:
+            raw_audio = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return None, (400, "bad_request", f"Audio part at index {index} has malformed base64 data")
+        duration = _wav_duration_seconds(raw_audio)
+        if duration is not None:
+            audio_seconds_total += duration
+            if audio_seconds_total > audio_seconds_limit:
+                return None, (400, "bad_request", "Audio input exceeds session policy audio_seconds_per_turn")
+        normalized.append(
+            {
+                "type": "audio",
+                "data_url": f"data:audio/wav;base64,{data}",
+                "mime_type": "audio/wav",
+                "byte_length": len(raw_audio),
+            }
+        )
+    return normalized, None
 
 
 def make_handler(app: App):
@@ -201,26 +294,43 @@ def make_handler(app: App):
             return data
 
         def do_GET(self) -> None:
-            if self.path == "/health":
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/health":
                 self._send_json(200, {"ok": True, "service": "mlx-turbo-gemma-service", "version": app.version})
                 return
-            if self.path == "/ready":
+            if path == "/ready":
                 payload = app.worker.ready_payload()
                 status = 200 if payload["ok"] or payload.get("cold_load_acceptable") else 503
                 self._send_json(status, payload)
                 return
-            if self.path == "/v1/models":
+            if path == "/v1/models":
                 self._send_json(200, app.worker.models_payload())
                 return
-            if self.path == "/admin/stats":
+            if path == "/admin/stats":
                 if not self._require_admin_access():
                     return
                 self._send_json(200, app.worker.stats_payload())
                 return
+            if path == "/v1/si-drones":
+                if not self._require_admin_access():
+                    return
+                self._send_json(200, {"object": "list", "data": [record.to_public_dict() for record in app.sessions.list()]})
+                return
+            if path.startswith("/v1/si-drones/") and path.count("/") == 3:
+                session_id = path.rsplit("/", 1)[-1]
+                record = app.sessions.get(session_id)
+                if record is None:
+                    self._error(404, "session_not_found", f"Unknown SI Drone session: {session_id}")
+                    return
+                self._send_json(200, record.to_public_dict())
+                return
             self._error(404, "bad_request", f"Unknown path: {self.path}")
 
         def do_POST(self) -> None:
-            if self.path == "/admin/worker/unload":
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/admin/worker/unload":
                 if not self._require_admin_access():
                     return
                 try:
@@ -228,7 +338,7 @@ def make_handler(app: App):
                 except RuntimeError as exc:
                     self._error(503, "worker_failed", str(exc), retryable=True)
                 return
-            if self.path == "/admin/worker/restart":
+            if path == "/admin/worker/restart":
                 if not self._require_admin_access():
                     return
                 try:
@@ -236,7 +346,114 @@ def make_handler(app: App):
                 except RuntimeError as exc:
                     self._error(503, "worker_failed", str(exc), retryable=True)
                 return
-            if self.path != "/v1/chat/completions":
+            if path == "/v1/si-drones":
+                record = app.sessions.create()
+                self._send_json(
+                    201,
+                    {
+                        "session_id": record.session_id,
+                        "policy": record.policy,
+                        "state": record.state,
+                        "created_at": record.created_at,
+                        "expires_at": record.expires_at,
+                    },
+                )
+                return
+            if path.startswith("/v1/si-drones/") and path.endswith("/turns"):
+                session_id = path.removeprefix("/v1/si-drones/").removesuffix("/turns").strip("/")
+                if not session_id:
+                    self._error(404, "session_not_found", "Missing SI Drone session id")
+                    return
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                record = app.sessions.get(session_id)
+                if record is None:
+                    self._error(404, "session_not_found", f"SI Drone session is not available: {session_id}")
+                    return
+                if record.turn_count >= int(record.policy["max_turns"]):
+                    self._error(409, "max_turns_exceeded", "max_turns_exceeded")
+                    return
+                current_worker_pid = app.worker.worker_pid()
+                if record.turn_count > 0 and record.worker_binding is not None and current_worker_pid != record.worker_binding:
+                    app.sessions.delete(session_id)
+                    self._error(409, "session_lost", "SI Drone worker session was lost", retryable=False)
+                    return
+                normalized_parts, part_error = normalize_session_parts(payload, record.policy)
+                if part_error is not None:
+                    status, error_type, message = part_error
+                    self._error(status, error_type, message)
+                    return
+                max_tokens = payload.get("max_tokens")
+                if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens <= 0):
+                    self._error(400, "bad_request", "Field 'max_tokens' must be a positive integer when provided")
+                    return
+                accepted, reason = app.worker.begin_request()
+                if not accepted:
+                    self._error(409 if reason in {"worker_busy", "queue_full"} else 503, reason or "worker_not_ready", "Worker is not ready for SI Drone turn", retryable=True)
+                    return
+                try:
+                    record = app.sessions.begin_turn(session_id)
+                except KeyError as exc:
+                    error_type = str(exc).strip("'") or "session_not_found"
+                    app.worker.complete_request_rejected(error_type)
+                    self._error(_session_error_status(error_type), error_type, f"SI Drone session is not available: {session_id}")
+                    return
+                except RuntimeError as exc:
+                    error_type = str(exc)
+                    app.worker.complete_request_rejected(error_type)
+                    self._error(_session_error_status(error_type), error_type, error_type)
+                    return
+                started = time.perf_counter()
+                try:
+                    result = app.worker.generate_session_turn(
+                        session_id,
+                        normalized_parts or [],
+                        max_tokens=max_tokens,
+                        policy=record.policy,
+                        turn_index=record.turn_count,
+                    )
+                    app.sessions.bind_worker(session_id, app.worker.worker_pid())
+                    app.worker.complete_request(success=True)
+                    self._send_json(
+                        200,
+                        {
+                            "session_id": session_id,
+                            "turn_index": record.turn_count,
+                            "completion": {
+                                "text": result.content,
+                                "finish_reason": result.finish_reason,
+                            },
+                            "metrics": result.metrics,
+                            "usage": result.usage,
+                            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                        },
+                    )
+                except TimeoutError:
+                    app.worker.complete_request(success=False, error="session_generate_timeout", failure_kind=FAILURE_TIMEOUT)
+                    self._error(504, "timeout", "Worker SI Drone turn timed out", retryable=True)
+                except RuntimeError as exc:
+                    raw_error = str(exc)
+                    failure_kind, clean_error = split_failure(raw_error)
+                    app.worker.complete_request(success=False, error=clean_error, failure_kind=failure_kind)
+                    if clean_error == "session_lost" or raw_error.endswith(":session_lost"):
+                        app.sessions.delete(session_id)
+                        self._error(409, "session_lost", "SI Drone worker session was lost", retryable=False)
+                    elif clean_error == "max_context_tokens_exceeded" or raw_error.endswith(":max_context_tokens_exceeded"):
+                        app.sessions.delete(session_id)
+                        self._error(409, "max_context_tokens_exceeded", "SI Drone session exceeded max_context_tokens", retryable=False)
+                    elif clean_error.startswith("unsupported_part_type") or raw_error.startswith("unsupported_part_type"):
+                        self._error(415, "unsupported_part_type", clean_error, retryable=False)
+                    elif clean_error.startswith("unsupported_backend") or raw_error.startswith("unsupported_backend"):
+                        self._error(503, "unsupported_backend", clean_error, retryable=False)
+                    else:
+                        self._error(503, "worker_failed", clean_error or raw_error, retryable=True)
+                except Exception as exc:  # pragma: no cover
+                    LOG.exception("Unexpected supervisor error during SI Drone turn")
+                    app.worker.complete_request(success=False, error=str(exc))
+                    self._error(500, "internal_error", "Unexpected internal error", retryable=False)
+                return
+            if path != "/v1/chat/completions":
                 self._error(404, "bad_request", f"Unknown path: {self.path}")
                 return
             payload = self._read_json_body()
@@ -365,6 +582,20 @@ def make_handler(app: App):
                 LOG.exception("Unexpected supervisor error during completion")
                 app.worker.complete_request(success=False, error=str(exc))
                 self._error(500, "internal_error", "Unexpected internal error", retryable=False)
+
+        def do_DELETE(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path.startswith("/v1/si-drones/") and path.count("/") == 3:
+                session_id = path.rsplit("/", 1)[-1]
+                record = app.sessions.delete(session_id)
+                app.worker.teardown_session(session_id)
+                if record is None:
+                    self._error(404, "session_not_found", f"Unknown SI Drone session: {session_id}")
+                    return
+                self._send_json(200, {"ok": True, "session_id": session_id, "state": "deleted"})
+                return
+            self._error(404, "bad_request", f"Unknown path: {self.path}")
 
     return Handler
 
@@ -504,7 +735,7 @@ def main() -> int:
     except KeyboardInterrupt:
         LOG.info("Shutting down supervisor shell")
     finally:
-        app.worker.shutdown()
+        app.shutdown()
         server.server_close()
     return 0
 

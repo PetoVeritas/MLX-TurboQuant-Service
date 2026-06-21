@@ -37,6 +37,7 @@ class VlmPreparedRequest:
     image_paths: list[str]
     audio_paths: list[str]
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    add_special_tokens: bool | None = None
 
     def cleanup(self) -> None:
         if self.temp_dir is not None:
@@ -73,7 +74,11 @@ _CHANNEL_MARKER_ANY_RE = re.compile(r"<\|?channel\|?>\s*[A-Za-z_][\w-]*\b")
 # following word. Prevents the strict-unknown path (e.g. a display artifact
 # like "<channel|>The forecast") from eating the first word of real content.
 _CHANNEL_MARKER_BARE_RE = re.compile(r"<\|?channel\|?>")
-_STRAY_CONTROL_RE = re.compile(r"<\|?(?:message|start|end|return)\|?>")
+_STRAY_CONTROL_RE = re.compile(
+    r"<\|?(?:message|start|end|return)\|?>|"
+    r"<end(?:_of_turn)?(?:>|$|[^\s>]*)?|"
+    r"<start_of_turn>(?:user|model)?"
+)
 _HIDDEN_CHANNELS = frozenset({"thought", "thinking", "analysis"})
 
 
@@ -460,6 +465,9 @@ class WorkerBackend:
             yield BackendStreamChunk(text=result.content)
         yield result
 
+    def teardown_session(self, _session_id: str) -> None:
+        return
+
 
 class StubBackend(WorkerBackend):
     name = "stub"
@@ -516,6 +524,59 @@ class StubBackend(WorkerBackend):
             yield BackendStreamChunk(text=text)
         yield result
 
+    def session_generate(
+        self,
+        session_id: str,
+        parts: list[dict[str, Any]],
+        *,
+        max_tokens: int | None,
+        policy: dict[str, Any],
+        turn_index: int = 0,
+    ) -> BackendResult:
+        text = " ".join(str(part.get("text", "")) for part in parts if part.get("type") == "text").strip()
+        audio_count = sum(1 for part in parts if part.get("type") == "audio")
+        memories = getattr(self, "_session_memories", None)
+        if not isinstance(memories, dict):
+            memories = {}
+            self._session_memories = memories
+        memory = memories.setdefault(session_id, {"texts": [], "audio_count": 0})
+        if text:
+            memory["texts"].append(text)
+        memory["audio_count"] += audio_count
+        content = f"[stub backend] si drone {session_id} turn accepted"
+        if text:
+            content += f": {text[:120]}"
+        cached_text = " ".join(str(item) for item in memory["texts"])
+        if cached_text:
+            content += f" | cached_text: {cached_text[:160]}"
+        if memory["audio_count"]:
+            content += f" | audio_count: {memory['audio_count']}"
+        return BackendResult(
+            content=content,
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": max(1, len(text.split()) + audio_count),
+                "completion_tokens": len(content.split()),
+                "total_tokens": max(1, len(text.split()) + audio_count) + len(content.split()),
+            },
+            metrics={
+                "prompt_tokens_new": max(1, len(text.split()) + audio_count),
+                "cached_tokens": 0,
+                "audio_token_count": audio_count,
+                "prefill_ms": 0,
+                "generation_ms": 0,
+                "context_tokens_total": max(1, len(text.split()) + audio_count),
+                "peak_memory_gb": None,
+                "session_policy_max_turns": int(policy.get("max_turns", 0) or 0),
+                "turn_index": int(turn_index or 0),
+            },
+        )
+
+    def teardown_session(self, session_id: str) -> None:
+        memories = getattr(self, "_session_memories", None)
+        if isinstance(memories, dict):
+            memories.pop(session_id, None)
+
 
 class MlxVlmTurboQuantBackend(WorkerBackend):
     name = "mlx_vlm_turboquant"
@@ -539,10 +600,17 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
 
         try:
             from mlx_vlm import generate, load  # type: ignore
+            from mlx_vlm.generate.ar import generate_step  # type: ignore
+            from mlx_vlm.models import cache as vlm_cache  # type: ignore
+            from mlx_vlm.utils import prepare_inputs  # type: ignore
         except Exception as exc:  # pragma: no cover - depends on local runtime
             raise RuntimeError(f"mlx_vlm_runtime_import_failed:{exc}") from exc
 
         self._generate = generate
+        self._generate_step = generate_step
+        self._vlm_cache = vlm_cache
+        self._prepare_inputs = prepare_inputs
+        self._session_caches: dict[str, list[Any]] = {}
         self._max_output_tokens = int(self._config.get("model", {}).get("maxOutputTokens", 1024) or 1024)
         sampling_cfg = self._config.get("model", {}).get("sampling", {})
         self._sampling_kwargs = self._generation_sampling_kwargs(sampling_cfg if isinstance(sampling_cfg, dict) else {})
@@ -580,6 +648,8 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
                 return apply_chat_template(template_messages, tools=tools, tokenize=False, add_generation_prompt=True)
             except Exception:
                 pass
+        if not tools and self._uses_gemma4_manual_chat_template():
+            return self._gemma4_manual_chat_prompt(template_messages, add_generation_prompt=True)
 
         rendered: list[str] = []
         for message in template_messages:
@@ -592,6 +662,39 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
             else:
                 rendered.append(content)
         return "\n\n".join(part for part in rendered if part).strip()
+
+    def _uses_gemma4_manual_chat_template(self) -> bool:
+        model = getattr(self, "_model", None)
+        model_type = str(getattr(getattr(model, "config", None), "model_type", "") or "")
+        return model_type in {"gemma4", "gemma4_unified"}
+
+    @staticmethod
+    def _message_text_content(message: dict[str, Any]) -> str:
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                    text_parts.append(part["text"])
+            return "\n".join(text_parts)
+        return str(content)
+
+    @classmethod
+    def _gemma4_manual_chat_prompt(cls, messages: list[dict[str, Any]], *, add_generation_prompt: bool) -> str:
+        rendered: list[str] = []
+        for message in messages:
+            role = str(message.get("role", "user"))
+            content = cls._message_text_content(message)
+            if role == "assistant":
+                turn_role = "model"
+            else:
+                turn_role = "user"
+            rendered.append(f"<start_of_turn>{turn_role}\n{content}<end_of_turn>\n")
+        if add_generation_prompt:
+            rendered.append("<start_of_turn>model\n")
+        return "".join(rendered)
 
     @staticmethod
     def _media_suffix(mime_type: str, modality: str) -> str:
@@ -679,7 +782,225 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
             image_paths=image_paths,
             audio_paths=audio_paths,
             temp_dir=temp_dir,
+            add_special_tokens=self._uses_gemma4_manual_chat_template() and not tools,
         )
+
+    def _prepare_session_parts(self, parts: list[dict[str, Any]], *, turn_index: int = 0) -> VlmPreparedRequest:
+        prompt_parts: list[str] = []
+        audio_paths: list[str] = []
+        temp_dir: tempfile.TemporaryDirectory[str] | None = None
+
+        for part in parts:
+            part_type = str(part.get("type", ""))
+            if part_type == "text":
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    prompt_parts.append(text)
+                continue
+            if part_type != "audio":
+                continue
+            data_url = part.get("data_url")
+            mime_type = str(part.get("mime_type", "audio/wav"))
+            if not isinstance(data_url, str):
+                raise RuntimeError("mlx_vlm_session_audio_missing_data_url")
+            if temp_dir is None:
+                temp_dir = tempfile.TemporaryDirectory(prefix="mlx-vlm-session-input-")
+            suffix = self._media_suffix(mime_type, "audio")
+            payload = self._decode_data_url(data_url)
+            media_path = Path(temp_dir.name) / f"audio-{len(audio_paths)}{suffix}"
+            media_path.write_bytes(payload)
+            audio_paths.append(str(media_path))
+            prompt_parts.append("<|audio|>")
+
+        prompt_content = "\n".join(prompt_parts).strip()
+        if self._uses_gemma4_manual_chat_template():
+            if int(turn_index or 0) <= 1:
+                prompt = self._gemma4_manual_chat_prompt([{"role": "user", "content": prompt_content}], add_generation_prompt=True)
+                add_special_tokens = True
+            else:
+                prompt = f"<end_of_turn>\n<start_of_turn>user\n{prompt_content}<end_of_turn>\n<start_of_turn>model\n"
+                add_special_tokens = False
+        else:
+            prompt = prompt_content
+            add_special_tokens = None
+
+        return VlmPreparedRequest(
+            prompt=prompt,
+            image_paths=[],
+            audio_paths=audio_paths,
+            temp_dir=temp_dir,
+            add_special_tokens=add_special_tokens,
+        )
+
+    def _cache_offsets(self, prompt_cache: list[Any]) -> list[int | None]:
+        offsets: list[int | None] = []
+        for cache_entry in prompt_cache:
+            offset = getattr(cache_entry, "offset", None)
+            if offset is None and getattr(cache_entry, "keys", None) is not None:
+                try:
+                    offset = cache_entry.keys.shape[2]
+                except Exception:
+                    offset = None
+            try:
+                offsets.append(int(offset) if offset is not None else None)
+            except Exception:
+                offsets.append(None)
+        return offsets
+
+    def _max_cache_offset(self, prompt_cache: list[Any]) -> int:
+        offsets = [offset for offset in self._cache_offsets(prompt_cache) if isinstance(offset, int)]
+        return max(offsets) if offsets else 0
+
+    def _eos_ids(self) -> set[int]:
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
+        ids: set[int] = set()
+        for source in (getattr(getattr(self._model, "config", None), "eos_token_id", None), getattr(tokenizer, "eos_token_id", None)):
+            if isinstance(source, int):
+                ids.add(source)
+            elif isinstance(source, (list, tuple)):
+                ids.update(int(value) for value in source if isinstance(value, int))
+        return ids
+
+    def _step_inputs(self, prepared: VlmPreparedRequest) -> dict[str, Any]:
+        model_type = str(getattr(getattr(self._model, "config", None), "model_type", "") or "")
+        add_special_tokens = bool(prepared.add_special_tokens)
+        if prepared.add_special_tokens is None and not prepared.image_paths and not prepared.audio_paths and model_type not in {"gemma3", "gemma3n", "gemma4", "gemma4_unified"}:
+            add_special_tokens = True
+        return self._prepare_inputs(
+            self._processor,
+            prompts=prepared.prompt,
+            images=prepared.image_paths or None,
+            audio=prepared.audio_paths or None,
+            add_special_tokens=add_special_tokens,
+            return_tensors="mlx",
+            padding=True,
+        )
+
+    def session_generate(
+        self,
+        session_id: str,
+        parts: list[dict[str, Any]],
+        *,
+        max_tokens: int | None,
+        policy: dict[str, Any],
+        turn_index: int = 0,
+    ) -> BackendResult:
+        for part in parts:
+            if part.get("type") not in {"text", "audio"}:
+                raise RuntimeError(f"unsupported_part_type:SI Drone v1 does not support part type: {part.get('type')}")
+
+        effective_max_tokens = self._max_output_tokens
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            effective_max_tokens = min(max_tokens, self._max_output_tokens)
+
+        if session_id not in self._session_caches and int(turn_index or 0) > 1:
+            raise RuntimeError("session_lost")
+        if session_id not in self._session_caches:
+            self._session_caches[session_id] = self._vlm_cache.make_prompt_cache(self._model.language_model)
+        prompt_cache = self._session_caches[session_id]
+        cached_tokens_before = self._max_cache_offset(prompt_cache)
+        max_context_tokens = int(policy.get("max_context_tokens", 0) or 0)
+        if max_context_tokens > 0 and cached_tokens_before >= max_context_tokens:
+            raise RuntimeError("max_context_tokens_exceeded")
+        prepared = self._prepare_session_parts(parts, turn_index=turn_index)
+        generation_started = time.perf_counter()
+        first_token_ms: int | None = None
+        generated: list[int] = []
+        try:
+            import mlx.core as mx  # type: ignore
+
+            inputs = self._step_inputs(prepared)
+            input_ids = inputs["input_ids"]
+            pixel_values = inputs.get("pixel_values")
+            mask = inputs.get("attention_mask")
+            extra_kwargs = {
+                key: value
+                for key, value in inputs.items()
+                if key not in {"input_ids", "pixel_values", "attention_mask"}
+            }
+            prompt_tokens_new = int(getattr(input_ids, "size", 0) or 0)
+            audio_token_id = getattr(self._processor, "audio_token_id", None)
+            audio_token_count = 0
+            if audio_token_id is not None:
+                try:
+                    audio_token_count = int(mx.sum(input_ids == int(audio_token_id)).item())
+                except Exception:
+                    audio_token_count = 0
+            mx.reset_peak_memory()
+            stop_ids = self._eos_ids()
+            tokenizer = getattr(self._processor, "tokenizer", self._processor)
+            gen = self._generate_step(
+                input_ids,
+                self._model,
+                pixel_values,
+                mask,
+                prompt_cache=prompt_cache,
+                max_tokens=effective_max_tokens,
+                temperature=float(self._sampling_kwargs.get("temperature", 0.0)),
+                top_p=float(self._sampling_kwargs.get("top_p", 1.0)),
+                **extra_kwargs,
+            )
+            for token_index, (token, _logprobs) in enumerate(gen):
+                if first_token_ms is None:
+                    first_token_ms = int((time.perf_counter() - generation_started) * 1000)
+                token_id = int(token.item() if hasattr(token, "item") else token)
+                generated.append(token_id)
+                if token_id in stop_ids:
+                    break
+                try:
+                    decoded_so_far = tokenizer.decode(generated)
+                except Exception:
+                    decoded_so_far = ""
+                if "<end_of_turn" in decoded_so_far or "<start_of_turn" in decoded_so_far:
+                    break
+            try:
+                raw_text = tokenizer.decode(generated, skip_special_tokens=True)
+            except TypeError:
+                raw_text = tokenizer.decode(generated)
+            peak_memory_gb = float(mx.get_peak_memory() / 1e9)
+            mx.clear_cache()
+        except Exception as exc:  # pragma: no cover - depends on local runtime
+            raise RuntimeError(f"mlx_vlm_session_generation_failed:{exc}") from exc
+        finally:
+            prepared.cleanup()
+
+        total_ms = int((time.perf_counter() - generation_started) * 1000)
+        content = strip_channel_markup(str(raw_text or "")).strip()
+        content, finish_reason, tool_calls = parse_tool_calls(content)
+        if not tool_calls and "\n\n" in content:
+            content = content.split("\n\n", 1)[0].strip()
+        if tool_calls:
+            finish_reason = "tool_calls"
+        completion_tokens = max(1, len(generated))
+        context_tokens_total = self._max_cache_offset(prompt_cache)
+        if max_context_tokens > 0 and context_tokens_total > max_context_tokens:
+            self.teardown_session(session_id)
+            raise RuntimeError("max_context_tokens_exceeded")
+        return BackendResult(
+            content=content,
+            finish_reason=finish_reason,
+            usage={
+                "prompt_tokens": prompt_tokens_new,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens_new + completion_tokens,
+            },
+            metrics={
+                "prompt_tokens_new": prompt_tokens_new,
+                "cached_tokens": cached_tokens_before,
+                "audio_token_count": audio_token_count,
+                "prefill_ms": first_token_ms if first_token_ms is not None else total_ms,
+                "generation_ms": total_ms,
+                "context_tokens_total": context_tokens_total,
+                "cache_offsets": self._cache_offsets(prompt_cache),
+                "peak_memory_gb": peak_memory_gb,
+                "session_policy_max_context_tokens": max_context_tokens,
+                "turn_index": int(turn_index or 0),
+            },
+            tool_calls=tool_calls,
+        )
+
+    def teardown_session(self, session_id: str) -> None:
+        self._session_caches.pop(session_id, None)
 
     def generate(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> BackendResult:
         effective_max_tokens = self._max_output_tokens

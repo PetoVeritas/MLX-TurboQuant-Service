@@ -59,8 +59,40 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
 | GET | `/v1/models` | Exposed model list (includes modality metadata) |
 | GET | `/admin/stats` | Worker metrics and config snapshot |
 | POST | `/v1/chat/completions` | OpenAI-style chat completions (SSE streaming supported) |
+| POST | `/v1/si-drones` | Create a short-lived stateful SI Drone inference session |
+| POST | `/v1/si-drones/{id}/turns` | Submit a text/audio turn to an SI Drone session |
+| DELETE | `/v1/si-drones/{id}` | Delete an SI Drone session and release its worker cache |
 | POST | `/admin/worker/unload` | Unload the worker |
 | POST | `/admin/worker/restart` | Restart the worker |
+
+### SI Drone Sessions
+
+SI Drone sessions keep a model-side prompt cache across a bounded sequence of turns. They are intended for local, short-lived stateful inference experiments, including audio prefill followed by text questions.
+
+Create a session:
+
+```bash
+curl -sS -X POST http://127.0.0.1:4017/v1/si-drones
+```
+
+Submit a turn:
+
+```bash
+curl -sS -X POST http://127.0.0.1:4017/v1/si-drones/sidr_example/turns \
+  -H 'Content-Type: application/json' \
+  -d '{"parts":[{"type":"text","text":"Remember this code: amber seven."}],"max_tokens":32}'
+```
+
+Supported v1 turn parts:
+
+- `{"type":"text","text":"..."}` for text
+- `{"type":"audio","audio":{"format":"wav","data":"<base64-wav>"}}` for WAV audio
+
+Delete a session:
+
+```bash
+curl -sS -X DELETE http://127.0.0.1:4017/v1/si-drones/sidr_example
+```
 
 ## Project Layout
 

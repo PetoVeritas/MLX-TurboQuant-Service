@@ -8,7 +8,7 @@ from typing import Any
 
 from shared.backend_adapters import backend_descriptor, backend_supported_modalities, configured_backend_id
 from shared.parts import modalities_status
-from worker.backends import BackendResult, MlxVlmDiffusionGemmaBackend, MlxVlmTurboQuantBackend, StubBackend
+from worker.backends import BackendResult, MlxVlmDiffusionGemmaBackend, MlxVlmTurboQuantBackend, StubBackend, strip_channel_markup
 from worker.main import handle_generate
 
 
@@ -67,6 +67,11 @@ class BackendAdapterTests(unittest.TestCase):
         self.assertEqual(StubBackend.supported_modalities_for_config(), {"text"})
         self.assertEqual(MlxVlmTurboQuantBackend.supported_modalities_for_config(), {"text", "image", "audio"})
         self.assertEqual(MlxVlmDiffusionGemmaBackend.supported_modalities_for_config(), {"text", "image"})
+
+    def test_strip_channel_markup_removes_partial_gemma_turn_markers(self):
+        self.assertEqual(strip_channel_markup("Amber 7\n<end_of_turn<end"), "Amber 7")
+        self.assertEqual(strip_channel_markup("cobalt lantern 42<end"), "cobalt lantern 42")
+        self.assertEqual(strip_channel_markup("4<end_of_turn>\n<start_of_turn>user\nWhat was asked?"), "4\n\nWhat was asked?")
 
     def test_turboquant_capabilities_follow_model_config_when_available(self):
         with tempfile.TemporaryDirectory() as tmp:

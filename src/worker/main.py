@@ -79,6 +79,39 @@ def handle_generate_stream(backend: Any, payload: dict[str, Any]) -> None:
     emit({"type": "error", "request_id": request_id, "error": "stream_generate_returned_no_result"})
 
 
+def handle_session_generate(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    request_id = payload.get("request_id", "unknown")
+    session_id = payload.get("session_id")
+    parts = payload.get("parts", [])
+    max_tokens = payload.get("max_tokens")
+    policy = payload.get("policy", {})
+    turn_index = payload.get("turn_index", 0)
+    if not isinstance(session_id, str) or not session_id:
+        return {"type": "error", "request_id": request_id, "error": "bad_request:missing_session_id"}
+    if not hasattr(backend, "session_generate"):
+        return {"type": "error", "request_id": request_id, "error": "unsupported_backend:Backend does not support SI Drone sessions"}
+    try:
+        result = backend.session_generate(session_id, parts, max_tokens=max_tokens, policy=policy, turn_index=turn_index)
+    except RuntimeError as exc:
+        return {"type": "error", "request_id": request_id, "error": str(exc)}
+    return {
+        "type": "session_result",
+        "request_id": request_id,
+        "session_id": session_id,
+        "content": result.content,
+        "finish_reason": result.finish_reason,
+        "usage": result.usage,
+        "metrics": result.metrics,
+    }
+
+
+def handle_session_teardown(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    session_id = payload.get("session_id")
+    if isinstance(session_id, str) and session_id and hasattr(backend, "teardown_session"):
+        backend.teardown_session(session_id)
+    return {"type": "session_teardown_ack", "session_id": session_id}
+
+
 def main() -> int:
     config = load_config()
     backend = build_backend(config)
@@ -107,6 +140,10 @@ def main() -> int:
             emit(handle_generate(backend, payload))
         elif command == "generate_stream":
             handle_generate_stream(backend, payload)
+        elif command == "session_generate":
+            emit(handle_session_generate(backend, payload))
+        elif command == "session_teardown":
+            emit(handle_session_teardown(backend, payload))
         elif command == "shutdown":
             emit({"type": "shutdown_ack", "pid": os.getpid()})
             return 0
