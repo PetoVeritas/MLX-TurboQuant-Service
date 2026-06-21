@@ -32,6 +32,21 @@ def config() -> dict:
     }
 
 
+def audio_config(*, audio_enabled: bool = True, backend: str = "mlx_vlm_diffusion_gemma") -> dict:
+    cfg = config()
+    cfg["worker"]["stubMode"] = False
+    cfg["worker"]["backend"] = backend
+    cfg["modalities"] = {
+        "text": {"enabled": True},
+        "image": {"enabled": True, "maxInputs": 1, "maxBytesMb": 1, "allowedMimeTypes": ["image/png"], "transport": ["data_url"]},
+        "audio": {"enabled": audio_enabled, "maxInputs": 1, "maxBytesMb": 1, "allowedMimeTypes": ["audio/wav"], "transport": ["data_url"]},
+        "video": {"enabled": False},
+        "document": {"enabled": False},
+        "strictCapabilityCheck": True,
+    }
+    return cfg
+
+
 def wav_b64(seconds: float = 0.05, rate: int = 16000) -> str:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as handle:
@@ -77,6 +92,26 @@ class SiDroneSessionTests(unittest.TestCase):
         self.assertEqual(parts[1]["type"], "audio")
         self.assertEqual(parts[1]["mime_type"], "audio/wav")
         self.assertTrue(parts[1]["data_url"].startswith("data:audio/wav;base64,"))
+
+    def test_normalize_session_parts_rejects_audio_disabled_by_lane(self):
+        parts, error = normalize_session_parts(
+            {"parts": [{"type": "audio", "audio": {"format": "wav", "data": wav_b64()}}]},
+            {"audio_seconds_per_turn": 8},
+            config=audio_config(audio_enabled=False, backend="mlx_vlm_turboquant"),
+        )
+
+        self.assertIsNone(parts)
+        self.assertEqual(error, (422, "unsupported_modality", "Modality is disabled: audio"))
+
+    def test_normalize_session_parts_rejects_audio_unsupported_by_effective_backend(self):
+        parts, error = normalize_session_parts(
+            {"parts": [{"type": "audio", "audio": {"format": "wav", "data": wav_b64()}}]},
+            {"audio_seconds_per_turn": 8},
+            config=audio_config(audio_enabled=True, backend="mlx_vlm_diffusion_gemma"),
+        )
+
+        self.assertIsNone(parts)
+        self.assertEqual(error, (422, "unsupported_modality", "Backend does not support requested modality: audio"))
 
     def test_normalize_session_parts_rejects_future_modalities_for_v1(self):
         parts, error = normalize_session_parts({"parts": [{"type": "image", "image": {}}]}, {"audio_seconds_per_turn": 8})
@@ -232,6 +267,7 @@ class SiDroneSessionTests(unittest.TestCase):
 
     def test_strip_channel_markup_removes_gemma_turn_markers(self):
         self.assertEqual(strip_channel_markup("4<end_of_turn>\n<start_of_turn>model"), "4")
+        self.assertEqual(strip_channel_markup("4<end_of__turn>\n<start_of_turn>model"), "4")
 
 
 if __name__ == "__main__":

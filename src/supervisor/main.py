@@ -15,8 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
+from shared.backend_adapters import backend_supported_modalities
 from shared.config import load_config
-from shared.parts import MessagePartError, extract_message_parts, part_modalities, parts_to_dicts, text_from_parts, validate_part_counts
+from shared.parts import MessagePartError, configured_modalities, extract_message_parts, part_modalities, parts_to_dicts, text_from_parts, validate_part_counts
 from supervisor.session_store import SessionStore
 from supervisor.worker_manager import CompletionChunk, CompletionResult, FAILURE_BACKEND, FAILURE_COOLDOWN, FAILURE_CRASH, FAILURE_GOVERNOR, FAILURE_PROTOCOL, FAILURE_STARTUP, FAILURE_TIMEOUT, WorkerManager
 
@@ -94,7 +95,21 @@ def _wav_duration_seconds(payload: bytes) -> float | None:
         return None
 
 
-def normalize_session_parts(payload: dict[str, Any], policy: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, tuple[int, str, str] | None]:
+def _session_modality_error(config: dict[str, Any] | None, modality: str) -> tuple[int, str, str] | None:
+    if not config:
+        return None
+    strict = bool(config.get("modalities", {}).get("strictCapabilityCheck", True))
+    if not strict:
+        return None
+    configured = configured_modalities(config)
+    if modality not in configured:
+        return 422, "unsupported_modality", f"Modality is disabled: {modality}"
+    if modality not in (configured & backend_supported_modalities(config)):
+        return 422, "unsupported_modality", f"Backend does not support requested modality: {modality}"
+    return None
+
+
+def normalize_session_parts(payload: dict[str, Any], policy: dict[str, Any], config: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]] | None, tuple[int, str, str] | None]:
     parts = payload.get("parts")
     if not isinstance(parts, list) or not parts:
         return None, (400, "bad_request", "Field 'parts' must be a non-empty array")
@@ -116,6 +131,9 @@ def normalize_session_parts(payload: dict[str, Any], policy: dict[str, Any]) -> 
             return None, (415, "unsupported_part_type", f"SI Drone v1 does not support part type: {part_type}")
         if part_type != "audio":
             return None, (400, "bad_request", f"Unsupported part type at index {index}: {part_type!r}")
+        modality_error = _session_modality_error(config, "audio")
+        if modality_error is not None:
+            return None, modality_error
 
         audio = part.get("audio")
         if not isinstance(audio, dict):
@@ -379,7 +397,7 @@ def make_handler(app: App):
                     app.sessions.delete(session_id)
                     self._error(409, "session_lost", "SI Drone worker session was lost", retryable=False)
                     return
-                normalized_parts, part_error = normalize_session_parts(payload, record.policy)
+                normalized_parts, part_error = normalize_session_parts(payload, record.policy, config=app.config)
                 if part_error is not None:
                     status, error_type, message = part_error
                     self._error(status, error_type, message)
