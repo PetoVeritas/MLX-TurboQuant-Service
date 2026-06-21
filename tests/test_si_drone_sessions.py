@@ -217,9 +217,20 @@ class SiDroneSessionTests(unittest.TestCase):
                 turn_index=2,
             )
 
-    def test_turboquant_session_parts_wrap_first_turn_with_gemma4_markers(self):
+    def test_turboquant_session_parts_wrap_first_turn_with_gemma4_template(self):
+        test_case = self
+
+        class Tokenizer:
+            def apply_chat_template(self, messages, *, tools=None, tokenize=False, add_generation_prompt=True):
+                test_case.assertIsNone(tools)
+                test_case.assertFalse(tokenize)
+                test_case.assertTrue(add_generation_prompt)
+                content = messages[0]["content"]
+                return f"<bos><|turn>user\n{content}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
         backend = MlxVlmTurboQuantBackend.__new__(MlxVlmTurboQuantBackend)
         backend._model = type("Model", (), {"config": type("Config", (), {"model_type": "gemma4"})()})()
+        backend._processor = Tokenizer()
         prepared = backend._prepare_session_parts(
             [
                 {"type": "text", "text": "before"},
@@ -230,16 +241,22 @@ class SiDroneSessionTests(unittest.TestCase):
         )
         self.addCleanup(prepared.cleanup)
 
-        self.assertEqual(prepared.prompt, "<start_of_turn>user\nbefore\n<|audio|>\nafter<end_of_turn>\n<start_of_turn>model\n")
-        self.assertTrue(prepared.add_special_tokens)
+        self.assertEqual(prepared.prompt, "<bos><|turn>user\nbefore\n<|audio|>\nafter<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
+        self.assertFalse(prepared.add_special_tokens)
         self.assertEqual(len(prepared.audio_paths), 1)
 
-    def test_turboquant_session_parts_append_followup_turn_without_special_tokens(self):
+    def test_turboquant_session_parts_append_followup_turn_as_gemma4_template_delta(self):
+        class Tokenizer:
+            def apply_chat_template(self, messages, *, tools=None, tokenize=False, add_generation_prompt=True):
+                content = messages[0]["content"]
+                return f"<bos><|turn>user\n{content}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
         backend = MlxVlmTurboQuantBackend.__new__(MlxVlmTurboQuantBackend)
         backend._model = type("Model", (), {"config": type("Config", (), {"model_type": "gemma4"})()})()
+        backend._processor = Tokenizer()
         prepared = backend._prepare_session_parts([{"type": "text", "text": "second turn"}], turn_index=2)
 
-        self.assertEqual(prepared.prompt, "<end_of_turn>\n<start_of_turn>user\nsecond turn<end_of_turn>\n<start_of_turn>model\n")
+        self.assertEqual(prepared.prompt, "<turn|>\n<|turn>user\nsecond turn<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
         self.assertFalse(prepared.add_special_tokens)
 
     def test_worker_session_teardown_calls_backend_hook(self):

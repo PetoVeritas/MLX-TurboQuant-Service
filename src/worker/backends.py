@@ -669,6 +669,10 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
         model_type = str(getattr(getattr(model, "config", None), "model_type", "") or "")
         return model_type in {"gemma4", "gemma4_unified"}
 
+    def _has_chat_template(self) -> bool:
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
+        return callable(getattr(tokenizer, "apply_chat_template", None))
+
     @staticmethod
     def _message_text_content(message: dict[str, Any]) -> str:
         content = message.get("content", "")
@@ -815,7 +819,14 @@ class MlxVlmTurboQuantBackend(WorkerBackend):
 
         prompt_content = "\n".join(prompt_parts).strip()
         if self._uses_gemma4_manual_chat_template():
-            if int(turn_index or 0) <= 1:
+            if self._has_chat_template():
+                prompt = self._build_prompt([{"role": "user", "content": prompt_content}], tools=None)
+                add_special_tokens = False
+                if int(turn_index or 0) > 1:
+                    if prompt.startswith("<bos>"):
+                        prompt = prompt[len("<bos>") :]
+                    prompt = f"<turn|>\n{prompt}"
+            elif int(turn_index or 0) <= 1:
                 prompt = self._gemma4_manual_chat_prompt([{"role": "user", "content": prompt_content}], add_generation_prompt=True)
                 add_special_tokens = True
             else:
