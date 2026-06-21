@@ -76,8 +76,9 @@ _CHANNEL_MARKER_ANY_RE = re.compile(r"<\|?channel\|?>\s*[A-Za-z_][\w-]*\b")
 _CHANNEL_MARKER_BARE_RE = re.compile(r"<\|?channel\|?>")
 _STRAY_CONTROL_RE = re.compile(
     r"<\|?(?:message|start|end|return)\|?>|"
-    r"<end(?:_of_turn)?(?:>|$|[^\s>]*)?|"
-    r"<start_of_turn>(?:user|model)?"
+    r"<end(?:_of_turn)?(?:>|(?=<)|$)|"
+    r"<start_of_turn>(?:user|model)?|"
+    r"<$"
 )
 _HIDDEN_CHANNELS = frozenset({"thought", "thinking", "analysis"})
 

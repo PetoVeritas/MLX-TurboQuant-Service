@@ -71,6 +71,8 @@ class BackendAdapterTests(unittest.TestCase):
     def test_strip_channel_markup_removes_partial_gemma_turn_markers(self):
         self.assertEqual(strip_channel_markup("Amber 7\n<end_of_turn<end"), "Amber 7")
         self.assertEqual(strip_channel_markup("cobalt lantern 42<end"), "cobalt lantern 42")
+        self.assertEqual(strip_channel_markup("cobalt lantern 42<"), "cobalt lantern 42")
+        self.assertEqual(strip_channel_markup("visit <endpoint> now"), "visit <endpoint> now")
         self.assertEqual(strip_channel_markup("4<end_of_turn>\n<start_of_turn>user\nWhat was asked?"), "4\n\nWhat was asked?")
 
     def test_turboquant_capabilities_follow_model_config_when_available(self):
