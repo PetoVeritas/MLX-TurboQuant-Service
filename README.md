@@ -4,10 +4,10 @@ Runs Gemma 4 models locally on Apple Silicon through a process-managed server bu
 
 The server has been exercised across multiple local Gemma 4 lanes:
 
-- **Gemma 4 26B-A4B TurboQuant 8-bit** — service id `gemma-local-mlx-turboquant-26b-a4b-8bit`; Hugging Face artifact `majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit` (local folder `majentik-gemma-4-26b-a4b-it-turboquant-mlx-8bit`)
-- **Gemma 4 E2B TurboQuant 4-bit** — service ids `gemma-local-mlx-turboquant-e2b-it-4bit-jade-73728` and `gemma-local-mlx-turboquant-e2b-it-4bit-voice-20k`; Hugging Face artifact `majentik/gemma-4-E2B-it-TurboQuant-MLX-4bit` (local folder `majentik-gemma-4-E2B-it-TurboQuant-MLX-4bit`)
-- **Gemma 4 E4B TurboQuant 8-bit** — service id `gemma-local-mlx-turboquant-e4b-it-8bit-audio-test-16k`; Hugging Face artifact `majentik/gemma-4-E4B-TurboQuant-MLX-8bit` (local folder `majentik-gemma-4-E4B-TurboQuant-MLX-8bit`)
-- **DiffusionGemma 26B-A4B 4-bit** — service id `diffusiongemma-local-mlx-26b-a4b-4bit`; Hugging Face artifact `mlx-community/diffusiongemma-26B-A4B-it-4bit` (local folder `mlx-community-diffusiongemma-26B-A4B-it-4bit`)
+- **Gemma 4 26B-A4B TurboQuant 8-bit** — `majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit`
+- **Gemma 4 E2B TurboQuant 4-bit** — `majentik/gemma-4-E2B-it-TurboQuant-MLX-4bit`
+- **Gemma 4 E4B TurboQuant 8-bit** — `majentik/gemma-4-E4B-TurboQuant-MLX-8bit`
+- **DiffusionGemma 26B-A4B 4-bit** — `mlx-community/diffusiongemma-26B-A4B-it-4bit`
 
 All lanes use the **`mlx-vlm`** runtime family. The autoregressive TurboQuant lanes use the Gemma4/TurboQuant backend path (with a vendored elastic-KV patch for Gemma 4 E2B/E4B TurboQuant models), while **DiffusionGemma** uses the separate `mlx-vlm` diffusion backend path, not the elastic-KV path. DiffusionGemma depends on a pinned upstream `mlx-vlm` build with native chunked prefill (`prefill_step_size: 2048`), which replaced the old dense-mask prefill path that made large prompts explode in memory; its local profile also uses the `entropy-bound` sampler to avoid the repetition loops seen with `confidence-threshold`. Both backend families share the same supervisor/worker lifecycle, OpenAI-compatible API, and tool-call response shape, while modality support still depends on the artifact and lane config: 26B TurboQuant has been run for text+image, E4B TurboQuant for text+image+audio, and DiffusionGemma is text+image only in the current local profile.
 
@@ -173,7 +173,8 @@ Validation snapshot from the 2026-06-21 E4B audio-test lane (`4021`):
 |---|---|
 | Text SI carryover | Passed: recalled `cobalt lantern 42` from cached text state without replaying turn 1. |
 | Different phrase audio carryover | Passed: recalled `Violet compass 83` from audio-seeded state with nonzero audio tokens. |
-| Longer audio detail recall | Passed: recalled `teal` from an audio clip containing multiple details. |
+| Multi-detail audio carryover | Passed: recalled `teal` from a short audio clip containing multiple details. |
+| Full-duration audio marker check | Not validated on 4021: the configured lane rejects audio turns over 15 seconds. An isolated exploratory run with the policy raised ingested a 38.243-second file but failed to recover the marker after the 35-second point. |
 | Audio vs. text comparison | Passed: audio path reported nonzero audio tokens, text path reported `0`, and both recalled `Marble Window 17`. |
 | Expiry and cleanup | Passed: test SI sessions were deleted, the 4021 worker unloaded, and 4017/4018/4019/4020/4021 health checks stayed OK. |
 
