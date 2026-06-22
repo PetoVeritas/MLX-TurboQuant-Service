@@ -58,11 +58,12 @@ def wav_b64(seconds: float = 0.05, rate: int = 16000) -> str:
 
 
 class SiDroneSessionTests(unittest.TestCase):
-    def test_session_store_caps_policy_and_counts_live_sessions(self):
+    def test_session_store_caps_lifecycle_policy_and_counts_live_sessions(self):
         counts: list[int] = []
         cfg = config()
         cfg["sessions"]["ttl_s"] = 999
         cfg["sessions"]["max_turns"] = 99
+        cfg["sessions"]["audio_seconds_per_turn"] = 999
         store = SessionStore(cfg, on_count_change=counts.append)
         self.addCleanup(store.shutdown)
 
@@ -70,10 +71,21 @@ class SiDroneSessionTests(unittest.TestCase):
 
         self.assertEqual(record.policy["ttl_s"], 300)
         self.assertEqual(record.policy["max_turns"], 16)
+        self.assertEqual(record.policy["audio_seconds_per_turn"], 999)
         self.assertEqual(counts[-1], 1)
         self.assertEqual(store.begin_turn(record.session_id).turn_count, 1)
         self.assertIsNotNone(store.delete(record.session_id))
         self.assertEqual(counts[-1], 0)
+
+    def test_session_store_defaults_audio_window_without_hard_ceiling(self):
+        store = SessionStore({"sessions": {}}, on_count_change=lambda _: None)
+        self.addCleanup(store.shutdown)
+        self.assertEqual(store.policy["audio_seconds_per_turn"], 45)
+
+        cfg = {"sessions": {"audio_seconds_per_turn": 120}}
+        store = SessionStore(cfg, on_count_change=lambda _: None)
+        self.addCleanup(store.shutdown)
+        self.assertEqual(store.policy["audio_seconds_per_turn"], 120)
 
     def test_normalize_session_parts_accepts_text_and_wav_audio(self):
         policy = {"audio_seconds_per_turn": 8}
