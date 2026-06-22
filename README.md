@@ -167,6 +167,17 @@ SI Drone sessions are explicit, bounded worker-cache sessions. Each session owns
 
 Treat SI Drone cache state as temporary model-side continuity, not durable memory: callers should not rely on it after expiry, worker unload, model/runtime change, or session deletion. Any production deployment should validate text and multimodal carryover against its own model artifact, modality policy, cleanup behavior, and runtime compatibility.
 
+Validation snapshot from local MVP SI Drone experiments:
+
+| Check | Turn pattern | Result |
+|---|---|---|
+| Text SI carryover | Turn 1 seeded text, later turn asked for recall without replaying turn 1. | Passed: recalled `cobalt lantern 42`. |
+| Different phrase audio carryover | Turn 1 seeded WAV audio, later turn asked for recall from session cache. | Passed: recalled `Violet compass 83` with nonzero audio tokens. |
+| Multi-detail audio carryover | Turn 1 seeded audio with several terms; later turn asked for one detail. | Passed: recalled `teal`; distractor/control terms included `orange`, `carrot`, `banana`. |
+| Full-duration audio marker check | 35-second audio ingestion probe plus follow-up marker recall. | Passed: the 35-second marker test validated ingestion and later recall within the configured SI audio window. |
+| Audio vs. text comparison | Parallel audio-seeded and text-seeded sessions used the same recall target. | Passed: audio path reported nonzero audio tokens, text path reported `0`, and both recalled `Marble Window 17`. |
+| Expiry and cleanup | Test sessions were deleted after recall checks. | Passed: worker cache state was released and sibling service health checks remained OK. |
+
 Create a session:
 
 ```bash
