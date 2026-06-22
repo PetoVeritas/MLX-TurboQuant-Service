@@ -1,15 +1,15 @@
-# MLX + SI Drone TurboQuant and Diffusion Server — Supervised, Local Gemma 4 with Stateful/Sessionized Inference Drone Service on Apple Silicon
+# MLX + SI Drone TurboQuant and Diffusion Server — Process-Managed Local Gemma 4 with Stateful/Sessionized Inference Drone Service on Apple Silicon
 
-Runs Gemma 4 models locally on Apple Silicon through a supervised server built for TurboQuant on MLX, exposing them as OpenAI-compatible provider boundaries and short-lived SI Drone sessions (which preserve model-side multimodal traces in the inference cache between turns) for OpenClaw-style agent stacks. A lightweight HTTP supervisor manages a separate worker process so the model stays up, restarts cleanly, and behaves predictably under agent workloads — single-target on purpose, not a generic multi-model surface.
+Runs Gemma 4 models locally on Apple Silicon through a process-managed server built for TurboQuant on MLX, exposing them as OpenAI-compatible provider boundaries and short-lived SI Drone sessions (which preserve model-side multimodal traces in the inference cache between turns) for OpenClaw-style agent stacks. A lightweight HTTP supervisor manages a separate worker process so the model stays up, restarts cleanly, and behaves predictably under agent workloads — single-target on purpose, not a generic multi-model surface.
 
 The server has been exercised across multiple local Gemma 4 lanes:
 
-- **Gemma 4 26B-A4B TurboQuant 8-bit** (`gemma-local-mlx-turboquant-26b-a4b-8bit`)
-- **Gemma 4 E2B TurboQuant 4-bit** (`gemma-local-mlx-turboquant-e2b-it-4bit-voice-16k`)
-- **Gemma 4 E4B TurboQuant 8-bit** (`gemma-local-mlx-turboquant-e4b-it-8bit-audio-test-16k`)
-- **DiffusionGemma 26B-A4B 4-bit** (`diffusiongemma-local-mlx-26b-a4b-4bit`)
+- **Gemma 4 26B-A4B TurboQuant 8-bit** — service id `gemma-local-mlx-turboquant-26b-a4b-8bit`; Hugging Face artifact `majentik/gemma-4-26B-A4B-it-TurboQuant-MLX-8bit` (local folder `majentik-gemma-4-26b-a4b-it-turboquant-mlx-8bit`)
+- **Gemma 4 E2B TurboQuant 4-bit** — service ids `gemma-local-mlx-turboquant-e2b-it-4bit-jade-73728` and `gemma-local-mlx-turboquant-e2b-it-4bit-voice-20k`; Hugging Face artifact `majentik/gemma-4-E2B-it-TurboQuant-MLX-4bit` (local folder `majentik-gemma-4-E2B-it-TurboQuant-MLX-4bit`)
+- **Gemma 4 E4B TurboQuant 8-bit** — service id `gemma-local-mlx-turboquant-e4b-it-8bit-audio-test-16k`; Hugging Face artifact `majentik/gemma-4-E4B-TurboQuant-MLX-8bit` (local folder `majentik-gemma-4-E4B-TurboQuant-MLX-8bit`)
+- **DiffusionGemma 26B-A4B 4-bit** — service id `diffusiongemma-local-mlx-26b-a4b-4bit`; Hugging Face artifact `mlx-community/diffusiongemma-26B-A4B-it-4bit` (local folder `mlx-community-diffusiongemma-26B-A4B-it-4bit`)
 
-The autoregressive TurboQuant lanes use **`mlx-vlm`** (with a vendored elastic-KV patch for Gemma 4 E2B/E4B TurboQuant models). The harness also supports **DiffusionGemma** (discrete-diffusion Gemma 4 26B-A4B) as a sibling backend, not as part of the elastic-KV path. DiffusionGemma depends on a pinned upstream `mlx-vlm` build with native chunked prefill (`prefill_step_size: 2048`), which replaced the old dense-mask prefill path that made large prompts explode in memory; its local profile also uses the `entropy-bound` sampler to avoid the repetition loops seen with `confidence-threshold`. Both backend families share the same supervisor/worker lifecycle, OpenAI-compatible API, and tool-call response shape, while modality support still depends on the artifact and lane config: 26B TurboQuant has been run for text+image, E4B TurboQuant for text+image+audio, and DiffusionGemma is text-only in the current local profile.
+All lanes use the **`mlx-vlm`** runtime family. The autoregressive TurboQuant lanes use the Gemma4/TurboQuant backend path (with a vendored elastic-KV patch for Gemma 4 E2B/E4B TurboQuant models), while **DiffusionGemma** uses the separate `mlx-vlm` diffusion backend path, not the elastic-KV path. DiffusionGemma depends on a pinned upstream `mlx-vlm` build with native chunked prefill (`prefill_step_size: 2048`), which replaced the old dense-mask prefill path that made large prompts explode in memory; its local profile also uses the `entropy-bound` sampler to avoid the repetition loops seen with `confidence-threshold`. Both backend families share the same supervisor/worker lifecycle, OpenAI-compatible API, and tool-call response shape, while modality support still depends on the artifact and lane config: 26B TurboQuant has been run for text+image, E4B TurboQuant for text+image+audio, and DiffusionGemma is text+image only in the current local profile.
 
 ## Why this exists
 
@@ -19,7 +19,7 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
 - a stable OpenAI-style chat endpoint with streaming
 - tool calling with hallucinated-tool containment
 - multimodal inference (image, audio) via `mlx-vlm`
-- supervised worker lifecycle management
+- process-managed worker lifecycle
 - local health and admin endpoints
 - smoke, recovery, and timeout testing
 - a cleaner path for evaluating MLX as a serious OpenClaw lane
@@ -70,36 +70,13 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
 
 ### Stateful/Sessionized Inference (SI) Drone Lanes
 
-SI Drones provide worker-pinned vRAM inference sessions for this supervised server. In typical cloud-hosted inference servers, each client request carries its full context history for each turn and gets scheduled across shared accelerator memory; the model does not keep a private, turn-by-turn recollection for a particular client. An SI Drone makes the opposite local tradeoff: it reserves one worker lane for an explicit session that keeps its model-side state hot in GPU-resident memory and its multimodal traces warm in the inference/KV cache.
+SI Drones provide worker-pinned vRAM inference sessions for this process-managed local server. In typical cloud-hosted inference servers, each client request carries its full context history for each turn and gets scheduled across shared accelerator memory; the model does not keep a private, turn-by-turn recollection for a particular client. An SI Drone makes the opposite local tradeoff: it reserves one worker lane for an explicit session that keeps its model-side state hot in GPU-resident memory and its multimodal traces warm in the inference/KV cache.
 
 That pinned cache lets native audio or images survive across follow-up turns without rebuilding the entire multimodal prompt. This is not general chat memory; it is temporary model-side continuity. Minimum viable product tests used 30-second audio ingestion with subsequent follow-up turns, which showed that SI Drone can carry cached traces into subsequent turns, extending native multimodal comprehension beyond the Gemma 4 30-second audio cap.
 
-Create a session:
+### DiffusionGemma Lane
 
-```bash
-curl -sS -X POST http://127.0.0.1:4017/v1/si-drones
-```
-
-Submit a turn:
-
-```bash
-curl -sS -X POST http://127.0.0.1:4017/v1/si-drones/sidr_example/turns \
-  -H 'Content-Type: application/json' \
-  -d '{"parts":[{"type":"text","text":"Remember this code: amber seven."}],"max_tokens":32}'
-```
-
-Supported v1 turn parts:
-
-- `{"type":"text","text":"..."}` for text
-- `{"type":"audio","audio":{"format":"wav","data":"<base64-wav>"}}` for WAV audio
-
-SI Drone usage metrics report `prompt_tokens` for the new turn input, including model-side audio placeholder tokens. `metrics.audio_token_count` breaks out the audio placeholders when present.
-
-Delete a session:
-
-```bash
-curl -sS -X DELETE http://127.0.0.1:4017/v1/si-drones/sidr_example
-```
+DiffusionGemma is the server's sibling discrete-diffusion Gemma 4 lane. It still runs through the `mlx-vlm` runtime family, but it does not generate tokens through the autoregressive TurboQuant/elastic-KV path. Instead, it denoises a text canvas, which changes the memory and streaming profile: long-prompt prefill must be chunked, sampler choice matters, and streaming emits finalized output rather than incremental draft tokens.
 
 ## Project Layout
 
@@ -177,18 +154,61 @@ Recommended local shape (based on actual memory measurements):
 - 26B lane: `rssEstimateLoadedGb: 29.0` (actual peak ~28.9 GB), `priority: 1`
 - E2B lane: `rssEstimateLoadedGb: 6.0` (actual peak ~4.4 GB), `priority: 2` or `3`
 - Portable default ceiling: `ceilingGb: 34.0` (conservative; safe on a 48 GB box)
-- Machines with more headroom can raise the ceiling and per-lane estimates in a local profile; see `config/diffusiongemma-4020.example.json` for a worked DiffusionGemma 4020 example. Tune these to your own hardware — they are machine-specific, not harness defaults.
+- Machines with more headroom can raise the ceiling and per-lane estimates in a local profile; see `config/diffusiongemma-4020.example.json` for a worked DiffusionGemma 4020 example. Tune these to your own hardware — they are machine-specific, not server defaults.
 - Keep `allowLowerPriorityToPreemptHigher: false` so E2B lanes cannot preempt 26B by default
 
 When a cold load would exceed the ceiling, the governor refuses admission with `governor_refused` unless a configured preemption path can safely unload lower-priority rows first.
 
 Note: the 26B TurboQuant model uses ~29 GB at peak under `mlx-vlm`. Configuring the estimate at 20 GB (the `mlx-lm` baseline) causes incorrect admission decisions. Set it to at least 29 GB for accurate co-residency.
 
+### SI Drone runtime notes
+
+SI Drone sessions are explicit, bounded worker-cache sessions. Each session owns its own `prompt_cache` keyed by `session_id`, accepts only the modalities enabled for that lane, and should be deleted when the caller is done. Expiry/deletion tears down the session cache; full RAM release still depends on normal worker idle unload or explicit unload.
+
+The validated audio SI path is currently the 4021 E4B audio-test lane, not the production E2B voice lane and not a production rollout. Treat SI Drone cache state as temporary model-side continuity, not durable memory: callers should not rely on it after expiry, worker unload, model/runtime change, or session deletion. Any future production promotion should include a fresh text+audio carryover pass, cleanup/expiry verification, and model/runtime compatibility check.
+
+Validation snapshot from the 2026-06-21 E4B audio-test lane (`4021`):
+
+| Check | Result |
+|---|---|
+| Text SI carryover | Passed: recalled `cobalt lantern 42` from cached text state without replaying turn 1. |
+| Different phrase audio carryover | Passed: recalled `Violet compass 83` from audio-seeded state with nonzero audio tokens. |
+| Longer audio detail recall | Passed: recalled `teal` from an audio clip containing multiple details. |
+| Audio vs. text comparison | Passed: audio path reported nonzero audio tokens, text path reported `0`, and both recalled `Marble Window 17`. |
+| Expiry and cleanup | Passed: test SI sessions were deleted, the 4021 worker unloaded, and 4017/4018/4019/4020/4021 health checks stayed OK. |
+
+Create a session:
+
+```bash
+curl -sS -X POST http://127.0.0.1:4017/v1/si-drones
+```
+
+Submit a turn:
+
+```bash
+curl -sS -X POST http://127.0.0.1:4017/v1/si-drones/sidr_example/turns \
+  -H 'Content-Type: application/json' \
+  -d '{"parts":[{"type":"text","text":"Remember this code: amber seven."}],"max_tokens":32}'
+```
+
+Supported v1 turn parts:
+
+- `{"type":"text","text":"..."}` for text
+- `{"type":"audio","audio":{"format":"wav","data":"<base64-wav>"}}` for WAV audio
+
+SI Drone usage metrics report `prompt_tokens` for the new turn input, including model-side audio placeholder tokens. `metrics.audio_token_count` breaks out the audio placeholders when present.
+
+Delete a session:
+
+```bash
+curl -sS -X DELETE http://127.0.0.1:4017/v1/si-drones/sidr_example
+```
+
 ### DiffusionGemma runtime notes
 
 DiffusionGemma's 4020 lane depends on native chunked prefill from pinned upstream `mlx-vlm` commit `a0578772e92409be880543c1d26d04fd00d840dc`. The original local `mlx-vlm==0.6.3` path built dense prompt-length-squared attention masks during prefill, so large real agent prompts created massive transient memory spikes even though the model weights themselves were much smaller. The pinned upstream path exposes `prefill_step_size`, and the local lane uses `prefill_step_size: 2048` so prefill runs in query chunks instead of materializing the whole attention grid at once.
 
-The other critical DiffusionGemma fix is sampler choice. `confidence-threshold` looked plausible but caused token lock-in and repetition loops on large agent prompts. The safe harness-native default is `diffusion_sampler: "entropy-bound"` alongside `prefill_step_size: 2048`. A plain reinstall from PyPI `mlx-vlm==0.6.3` can silently remove the native chunked-prefill support even though the package metadata still reports `0.6.3`.
+The other critical DiffusionGemma fix is sampler choice. `confidence-threshold` looked plausible but caused token lock-in and repetition loops on large agent prompts. The safe server-native default is `diffusion_sampler: "entropy-bound"` alongside `prefill_step_size: 2048`. A plain reinstall from PyPI `mlx-vlm==0.6.3` can silently remove the native chunked-prefill support even though the package metadata still reports `0.6.3`.
 
 ## Tool Calling
 
@@ -277,7 +297,7 @@ It currently supports:
 - multimodal inference (image, audio) via data URL
 - tool calling with hallucinated-tool containment
 - streaming responses with channel-markup containment
-- supervised worker startup, idle unload, and recovery
+- process-managed worker startup, idle unload, and recovery
 - readiness and stats inspection that stays responsive during active generation
 - cold/warm request validation and fixture-based cleanliness checks
 - shared memory-governor admission for sibling lanes
@@ -299,7 +319,7 @@ It currently supports:
 
 ## Development note
 
-Built AI-assisted, using personal [OpenClaw](https://github.com/openclaw/openclaw) agents as coding collaborators.
+Built AI-assisted, using personal [OpenClaw](https://github.com/openclaw/openclaw) agents as coding contributors (powered by GPT-5.5 Codex, Claude Opus 4.6, and Claude Opus 4.8).
 
 ---
 
