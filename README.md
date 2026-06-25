@@ -72,7 +72,7 @@ This project exists to make local Gemma 4 inference **with TurboQuant** operatio
 
 SI Drones provide worker-pinned vRAM inference sessions for this process-managed local server. In typical cloud-hosted inference servers, each client request carries its full context history for each turn and gets scheduled across shared accelerator memory; the model does not keep a private, turn-by-turn recollection for a particular client. An SI Drone makes the opposite local tradeoff: it reserves one worker process for an explicit session that keeps its model-side state hot in GPU-resident memory and its multimodal traces warm in the inference/KV cache.
 
-That pinned cache lets native audio or images survive across follow-up turns without rebuilding the entire multimodal prompt. This is not general chat memory; it is temporary model-side continuity. Minimum viable product tests used 30-second audio ingestion with subsequent follow-up turns, which showed that SI Drone can carry cached traces into subsequent turns, extending native multimodal comprehension beyond the Gemma 4 30-second audio cap.
+That pinned cache lets native audio or images survive across follow-up turns without rebuilding the entire multimodal prompt. This is not general chat memory; it is temporary model-side continuity. MVP tests started with 30-second audio ingestion; the current supervisor policy defaults to and caps local configuration at `audio_seconds_per_turn: 45`.
 
 ### DiffusionGemma Profile
 
@@ -165,7 +165,7 @@ Note: the 26B TurboQuant model uses ~29 GB at peak under `mlx-vlm`. Configuring 
 
 SI Drone sessions are explicit, bounded worker-cache sessions. Each session owns its own `prompt_cache` keyed by `session_id`, accepts only the modalities enabled for the active profile, and should be deleted when the caller is done. Expiry/deletion tears down the session cache; full RAM release still depends on normal worker idle unload or explicit unload.
 
-Treat SI Drone cache state as temporary model-side continuity, not durable memory: callers should not rely on it after expiry, worker unload, model/runtime change, or session deletion. Any production deployment should validate text and multimodal carryover against its own model artifact, modality policy, cleanup behavior, and runtime compatibility.
+Treat SI Drone cache state as temporary model-side continuity, not durable memory: callers should not rely on it after expiry, worker unload, model/runtime change, or session deletion. The default SI audio policy is `audio_seconds_per_turn: 45`; local config may lower that window, but values above 45 are clamped by the supervisor. Any production deployment should validate text and multimodal carryover against its own model artifact, modality policy, cleanup behavior, and runtime compatibility.
 
 Validation snapshot from local MVP SI Drone experiments:
 

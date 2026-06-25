@@ -20,6 +20,7 @@ SESSION_POLICY_CEILINGS = {
     "ttl_s": 300,
     "max_turns": 16,
     "max_context_tokens": 20_000,
+    "audio_seconds_per_turn": 45,
 }
 
 
@@ -81,11 +82,6 @@ class SessionStore:
             except (TypeError, ValueError):
                 value = int(policy[key])
             policy[key] = max(1, min(value, ceiling))
-        try:
-            audio_seconds = int(raw_policy.get("audio_seconds_per_turn", policy["audio_seconds_per_turn"]))
-        except (TypeError, ValueError):
-            audio_seconds = int(policy["audio_seconds_per_turn"])
-        policy["audio_seconds_per_turn"] = max(1, audio_seconds)
         on_overflow = raw_policy.get("onOverflow", raw_policy.get("on_overflow", policy["on_overflow"]))
         policy["on_overflow"] = "reject" if on_overflow != "reject" else "reject"
         return policy

@@ -6,7 +6,7 @@ import unittest
 import wave
 
 from supervisor.main import normalize_session_parts
-from supervisor.session_store import SessionStore
+from supervisor.session_store import SESSION_POLICY_CEILINGS, SessionStore
 from supervisor.worker_manager import WorkerManager
 from worker.backends import MlxVlmTurboQuantBackend, StubBackend, strip_channel_markup
 from worker.main import handle_session_generate, handle_session_teardown
@@ -71,21 +71,33 @@ class SiDroneSessionTests(unittest.TestCase):
 
         self.assertEqual(record.policy["ttl_s"], 300)
         self.assertEqual(record.policy["max_turns"], 16)
-        self.assertEqual(record.policy["audio_seconds_per_turn"], 999)
+        self.assertEqual(record.policy["audio_seconds_per_turn"], 45)
         self.assertEqual(counts[-1], 1)
         self.assertEqual(store.begin_turn(record.session_id).turn_count, 1)
         self.assertIsNotNone(store.delete(record.session_id))
         self.assertEqual(counts[-1], 0)
 
-    def test_session_store_defaults_audio_window_without_hard_ceiling(self):
+    def test_session_store_caps_audio_window_at_policy_ceiling(self):
+        self.assertEqual(SESSION_POLICY_CEILINGS["audio_seconds_per_turn"], 45)
+
         store = SessionStore({"sessions": {}}, on_count_change=lambda _: None)
         self.addCleanup(store.shutdown)
         self.assertEqual(store.policy["audio_seconds_per_turn"], 45)
 
-        cfg = {"sessions": {"audio_seconds_per_turn": 120}}
+        cfg = {"sessions": {"audio_seconds_per_turn": 60}}
         store = SessionStore(cfg, on_count_change=lambda _: None)
         self.addCleanup(store.shutdown)
-        self.assertEqual(store.policy["audio_seconds_per_turn"], 120)
+        self.assertEqual(store.policy["audio_seconds_per_turn"], 45)
+
+        cfg = {"sessions": {"audio_seconds_per_turn": 45}}
+        store = SessionStore(cfg, on_count_change=lambda _: None)
+        self.addCleanup(store.shutdown)
+        self.assertEqual(store.policy["audio_seconds_per_turn"], 45)
+
+        cfg = {"sessions": {"audio_seconds_per_turn": 8}}
+        store = SessionStore(cfg, on_count_change=lambda _: None)
+        self.addCleanup(store.shutdown)
+        self.assertEqual(store.policy["audio_seconds_per_turn"], 8)
 
     def test_normalize_session_parts_accepts_text_and_wav_audio(self):
         policy = {"audio_seconds_per_turn": 8}
@@ -104,6 +116,50 @@ class SiDroneSessionTests(unittest.TestCase):
         self.assertEqual(parts[1]["type"], "audio")
         self.assertEqual(parts[1]["mime_type"], "audio/wav")
         self.assertTrue(parts[1]["data_url"].startswith("data:audio/wav;base64,"))
+
+    def test_normalize_session_parts_applies_audio_limit_to_single_part(self):
+        policy = {"audio_seconds_per_turn": 45}
+
+        parts, error = normalize_session_parts(
+            {"parts": [{"type": "audio", "audio": {"format": "wav", "data": wav_b64(seconds=44)}}]},
+            policy,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(len(parts), 1)
+
+        parts, error = normalize_session_parts(
+            {"parts": [{"type": "audio", "audio": {"format": "wav", "data": wav_b64(seconds=46)}}]},
+            policy,
+        )
+        self.assertIsNone(parts)
+        self.assertEqual(error, (400, "bad_request", "Audio input exceeds session policy audio_seconds_per_turn"))
+
+    def test_normalize_session_parts_applies_audio_limit_cumulatively(self):
+        policy = {"audio_seconds_per_turn": 45}
+
+        parts, error = normalize_session_parts(
+            {
+                "parts": [
+                    {"type": "audio", "audio": {"format": "wav", "data": wav_b64(seconds=22)}},
+                    {"type": "audio", "audio": {"format": "wav", "data": wav_b64(seconds=22)}},
+                ]
+            },
+            policy,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(len(parts), 2)
+
+        parts, error = normalize_session_parts(
+            {
+                "parts": [
+                    {"type": "audio", "audio": {"format": "wav", "data": wav_b64(seconds=23)}},
+                    {"type": "audio", "audio": {"format": "wav", "data": wav_b64(seconds=23)}},
+                ]
+            },
+            policy,
+        )
+        self.assertIsNone(parts)
+        self.assertEqual(error, (400, "bad_request", "Audio input exceeds session policy audio_seconds_per_turn"))
 
     def test_normalize_session_parts_rejects_audio_disabled_by_lane(self):
         parts, error = normalize_session_parts(
