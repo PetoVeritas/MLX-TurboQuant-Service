@@ -12,6 +12,13 @@
       "temperature": 0.7,
       "topP": 0.9
     },
+    "kvCache": {
+      "enabled": false,
+      "bits": 4,
+      "groupSize": 64,
+      "quantizedKvStart": 2048,
+      "quantScheme": "turboquant"
+    },
     "diffusion": {
       "max_denoising_steps": 48,
       "diffusion_sampler": "entropy-bound",
@@ -70,7 +77,14 @@
     "stateDir": "~/Library/Application Support/MLX-TurboQuant-Governor",
     "ceilingGb": 34.0,
     "allowLowerPriorityToPreemptHigher": false,
-    "staleAfterSeconds": 900
+    "staleAfterSeconds": 900,
+    "driftCheck": {
+      "enabled": true,
+      "latestKnownGoodCommit": "",
+      "lanes": [],
+      "sourceOfTruth": "governor.driftCheck.latestKnownGoodCommit",
+      "updatedBy": "deployment operator or rollout automation after an approved lane deployment"
+    }
   },
   "worker": {
     "backend": "mlx_vlm_turboquant",

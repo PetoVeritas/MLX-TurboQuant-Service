@@ -30,10 +30,14 @@ def handle_generate(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
     messages = payload.get("messages", [])
     max_tokens = payload.get("max_tokens")
     tools = payload.get("tools")
+    options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
 
     try:
         ensure_backend_supports_messages(backend, messages)
-        result = backend.generate(messages, max_tokens, tools=tools)
+        if options:
+            result = backend.generate(messages, max_tokens, tools=tools, options=options)
+        else:
+            result = backend.generate(messages, max_tokens, tools=tools)
     except RuntimeError as exc:
         return {"type": "error", "request_id": request_id, "error": str(exc)}
 
@@ -45,6 +49,7 @@ def handle_generate(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
         "usage": result.usage,
         "metrics": result.metrics,
         "tool_calls": result.tool_calls,
+        "reasoning_content": result.reasoning_content,
     }
 
 
@@ -53,12 +58,14 @@ def handle_generate_stream(backend: Any, payload: dict[str, Any]) -> None:
     messages = payload.get("messages", [])
     max_tokens = payload.get("max_tokens")
     tools = payload.get("tools")
+    options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
 
     try:
         ensure_backend_supports_messages(backend, messages)
-        for event in backend.stream_generate(messages, max_tokens, tools=tools):
+        stream = backend.stream_generate(messages, max_tokens, tools=tools, options=options) if options else backend.stream_generate(messages, max_tokens, tools=tools)
+        for event in stream:
             if isinstance(event, BackendStreamChunk):
-                emit({"type": "completion_chunk", "request_id": request_id, "content": event.text})
+                emit({"type": "completion_chunk", "request_id": request_id, "content": event.text, "reasoning_content": event.reasoning_content})
             elif isinstance(event, BackendResult):
                 emit(
                     {
@@ -69,6 +76,7 @@ def handle_generate_stream(backend: Any, payload: dict[str, Any]) -> None:
                         "usage": event.usage,
                         "metrics": event.metrics,
                         "tool_calls": event.tool_calls,
+                        "reasoning_content": event.reasoning_content,
                     }
                 )
                 return
@@ -112,10 +120,36 @@ def handle_session_teardown(backend: Any, payload: dict[str, Any]) -> dict[str, 
     return {"type": "session_teardown_ack", "session_id": session_id}
 
 
+def handle_speech_generate(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    request_id = payload.get("request_id", "unknown")
+    request = payload.get("request", {})
+    if not hasattr(backend, "speech_generate"):
+        return {"type": "speech_error", "request_id": request_id, "error": {"code": "unsupported_backend", "message": "Backend does not support speech.generate", "status": 503, "details": {}}}
+    if not isinstance(request, dict):
+        return {"type": "speech_error", "request_id": request_id, "error": {"code": "bad_request", "message": "Speech request must be an object", "status": 400, "details": {}}}
+    try:
+        result = backend.speech_generate(request)
+    except RuntimeError as exc:
+        return {"type": "speech_error", "request_id": request_id, "error": {"code": "generation_failed", "message": str(exc), "status": 500, "details": {}}}
+    result["request_id"] = request_id
+    return result
+
+
+def backend_stats(backend: Any) -> dict[str, Any]:
+    stats = getattr(backend, "stats", None)
+    if not callable(stats):
+        return {}
+    try:
+        result = stats()
+    except Exception as exc:
+        return {"error": str(exc)}
+    return result if isinstance(result, dict) else {}
+
+
 def main() -> int:
     config = load_config()
     backend = build_backend(config)
-    emit({"type": "worker_started", "pid": os.getpid(), "backend": getattr(backend, "name", "unknown")})
+    emit({"type": "worker_started", "pid": os.getpid(), "backend": getattr(backend, "name", "unknown"), "stats": backend_stats(backend)})
     # Binary stdin to match supervisor's binary-mode Popen. Explicit
     # readline loop avoids `for line in sys.stdin:` which routes through
     # TextIOWrapper and raced on back-to-back streaming requests.
@@ -144,6 +178,8 @@ def main() -> int:
             emit(handle_session_generate(backend, payload))
         elif command == "session_teardown":
             emit(handle_session_teardown(backend, payload))
+        elif command == "speech_generate":
+            emit(handle_speech_generate(backend, payload))
         elif command == "shutdown":
             emit({"type": "shutdown_ack", "pid": os.getpid()})
             return 0

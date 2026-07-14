@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from shared.governor import GovernorAdmissionError, MemoryGovernor
+from shared.governor import GovernorAdmissionError, MemoryGovernor, evaluate_lane_version_drift
 from shared.parts import modalities_status
 
 
@@ -31,6 +31,8 @@ FAILURE_UNLOAD = "unload_failure"
 FAILURE_CONFIG = "invalid_config"
 FAILURE_COOLDOWN = "cooldown_active"
 FAILURE_GOVERNOR = "governor_refused"
+MEMORY_STATS_UNITS = "GiB"
+MEMORY_STATS_SAMPLING_POINTS = ["before_load", "after_load", "request_start", "prefill_peak", "post_generation", "idle", "after_unload"]
 
 
 @dataclass
@@ -38,13 +40,15 @@ class CompletionResult:
     content: str
     finish_reason: str
     usage: dict[str, int]
-    metrics: dict[str, int | float | None]
+    metrics: dict[str, Any]
     tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass
 class CompletionChunk:
     content: str
+    reasoning_content: str | None = None
 
 
 class WorkerManager:
@@ -89,6 +93,7 @@ class WorkerManager:
         self._last_failure_kind: str | None = None
         self._consecutive_failures = 0
         self._cooldown_until = 0.0
+        self._backend_stats: dict[str, Any] = {}
         self._process: subprocess.Popen[str] | None = None
         self._stderr_handle: Any | None = None
         # Worker stdout is read by a dedicated daemon thread so we never call
@@ -154,6 +159,40 @@ class WorkerManager:
     def _clear_cooldown_locked(self) -> None:
         self._cooldown_until = 0.0
 
+    def _update_backend_stats_locked(self, stats: Any) -> None:
+        if isinstance(stats, dict):
+            self._backend_stats = dict(stats)
+
+    def _update_backend_stats_from_metrics_locked(self, metrics: Any) -> None:
+        if not isinstance(metrics, dict):
+            return
+        memory = metrics.get("memory")
+        if isinstance(memory, dict):
+            self._backend_stats = {**self._backend_stats, "memory": dict(memory)}
+
+    def _set_after_unload_backend_stats_locked(self) -> None:
+        self._backend_stats = {
+            "memory": {
+                "units": MEMORY_STATS_UNITS,
+                "unit_note": "Fields ending in _gb are binary GiB (1024^3 bytes).",
+                "metal_reconcile_tolerance_gb": 0.25,
+                "sampling_points": MEMORY_STATS_SAMPLING_POINTS,
+                "samples": {
+                    "after_unload": {
+                        "sampling_point": "after_unload",
+                        "units": MEMORY_STATS_UNITS,
+                        "rss_gb": None,
+                        "metal_active_gb": None,
+                        "metal_peak_gb": None,
+                        "metal_cache_gb": None,
+                        "weights_gb": 0.0,
+                        "kv_gb": 0.0,
+                        "other_metal_gb": None,
+                    }
+                },
+            }
+        }
+
     def _record_success_locked(self) -> None:
         self._consecutive_failures = 0
         self._last_failure_kind = None
@@ -216,6 +255,8 @@ class WorkerManager:
         return bool(self._config.get("worker", {}).get("lazyLoad", True))
 
     def _set_not_loaded_state(self, *, error: str | None = None) -> None:
+        if "after_unload" not in self._backend_stats.get("memory", {}).get("samples", {}):
+            self._backend_stats = {}
         valid_model = self._model_config_valid()
         lazy_load = self._lazy_load_enabled()
         self._cold_load_expected = lazy_load and valid_model
@@ -285,10 +326,13 @@ class WorkerManager:
             self._governor_admitted = False
 
     def _reset_to_not_loaded(self) -> None:
+        had_worker_state = bool(self._process or self._loaded)
         self._process = None
         self._stdout_queue = None
         self._close_stderr_handle()
         self._release_governor_reservation()
+        if had_worker_state:
+            self._set_after_unload_backend_stats_locked()
         self._set_not_loaded_state(error=None)
 
     def _mark_failed(self, error: str, *, failure_kind: str = FAILURE_BACKEND) -> None:
@@ -451,6 +495,7 @@ class WorkerManager:
                     "live_session_count": self._live_session_count,
                 },
                 "metrics": dict(self._metrics),
+                "backend": dict(self._backend_stats),
                 "config": {
                     "startup_timeout_s": self._worker_start_timeout,
                     "request_timeout_s": self._worker_request_timeout,
@@ -470,6 +515,7 @@ class WorkerManager:
                     "rss_estimate_loaded_gb": self._governor.rss_estimate_gb,
                     "ceiling_gb": self._governor.ceiling_gb,
                     "admitted": self._governor_admitted,
+                    "drift_check": evaluate_lane_version_drift(self._config),
                 },
                 "modalities": modalities_status(self._config),
             }
@@ -602,6 +648,7 @@ class WorkerManager:
             raise RuntimeError(f"{FAILURE_PROTOCOL}:Unexpected worker bootstrap message: {started}")
         with self._state_lock:
             self._loaded = True
+            self._update_backend_stats_locked(started.get("stats"))
             self._last_error = None
             self._last_activity_at = time.time()
             self._metrics["worker_starts"] += 1
@@ -701,6 +748,7 @@ class WorkerManager:
             self._process = None
             self._stdout_queue = None
             self._loaded = False
+            self._set_after_unload_backend_stats_locked()
             self._close_stderr_handle()
             self._release_governor_reservation()
             LOG.info("worker_terminated %s", json.dumps({"pid": prior_pid, "force": force}, sort_keys=True))
@@ -878,6 +926,7 @@ class WorkerManager:
         messages: list[dict[str, Any]],
         max_tokens: int | None,
         tools: list[dict[str, Any]] | None,
+        options: dict[str, Any] | None = None,
         *,
         stream: bool,
     ) -> str:
@@ -917,18 +966,19 @@ class WorkerManager:
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "tools": tools,
+                "options": options or {},
             }
         )
         return request_id
 
-    def generate_completion(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None) -> CompletionResult:
+    def generate_completion(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None, options: dict[str, Any] | None = None) -> CompletionResult:
         # Acquire _worker_lock (serializes against other generations, admin
         # unload/restart, and idle-unload) but NOT _state_lock across the full
         # request. Readers like /ready, /admin/stats, /v1/models only need
         # _state_lock and so remain responsive during generation.
         with self._worker_lock:
             try:
-                self._begin_worker_request_locked(messages, max_tokens, tools, stream=False)
+                self._begin_worker_request_locked(messages, max_tokens, tools, options, stream=False)
                 message = self._read_message(timeout_seconds=self._worker_request_timeout, timeout_metric="request_timeouts")
             except TimeoutError:
                 with self._state_lock:
@@ -949,8 +999,10 @@ class WorkerManager:
         if message.get("type") != "completion_result":
             raise RuntimeError(f"{FAILURE_PROTOCOL}:Unexpected worker response: {message}")
 
+        metrics = dict(message.get("metrics", {}))
         with self._state_lock:
             pid = self._worker_pid()
+            self._update_backend_stats_from_metrics_locked(metrics)
         LOG.info(
             "worker_request_complete %s",
             json.dumps(
@@ -969,8 +1021,9 @@ class WorkerManager:
             content=str(message["content"]),
             finish_reason=str(message.get("finish_reason", "stop")),
             usage=dict(message.get("usage", {})),
-            metrics=dict(message.get("metrics", {})),
+            metrics=metrics,
             tool_calls=message.get("tool_calls"),
+            reasoning_content=message.get("reasoning_content") if isinstance(message.get("reasoning_content"), str) else None,
         )
 
     def generate_session_turn(
@@ -1036,13 +1089,53 @@ class WorkerManager:
         if message.get("type") != "session_result":
             raise RuntimeError(f"{FAILURE_PROTOCOL}:Unexpected worker response: {message}")
 
+        metrics = dict(message.get("metrics", {}))
+        with self._state_lock:
+            self._update_backend_stats_from_metrics_locked(metrics)
         return CompletionResult(
             content=str(message.get("content", "")),
             finish_reason=str(message.get("finish_reason", "stop")),
             usage=dict(message.get("usage", {})),
-            metrics=dict(message.get("metrics", {})),
+            metrics=metrics,
             tool_calls=None,
         )
+
+    def generate_speech(self, request: dict[str, Any]) -> dict[str, Any]:
+        with self._worker_lock:
+            try:
+                self._spawn_worker_if_needed()
+                with self._state_lock:
+                    if self._state != "busy":
+                        self._set_state("busy", accepting_requests=False, loaded=True, error=None)
+                    request_id = f"req_{next(self._request_counter)}_{uuid.uuid4().hex[:8]}"
+                    pid = self._worker_pid()
+                LOG.info(
+                    "worker_speech_generate_start %s",
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "pid": pid,
+                            "model": request.get("model"),
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                self._send({"command": "speech_generate", "request_id": request_id, "request": request})
+                message = self._read_message(timeout_seconds=self._worker_request_timeout, timeout_metric="request_timeouts")
+            except TimeoutError:
+                with self._state_lock:
+                    self._terminate_process_locked(force=True)
+                raise
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                with self._state_lock:
+                    self._terminate_process_locked(force=True)
+                raise RuntimeError(f"{FAILURE_CRASH}:Worker speech request crashed:{exc}") from exc
+
+        if message.get("type") not in {"speech_result", "speech_error"}:
+            raise RuntimeError(f"{FAILURE_PROTOCOL}:Unexpected worker response: {message}")
+        return message
 
     def teardown_session(self, session_id: str) -> None:
         with self._worker_lock:
@@ -1055,17 +1148,21 @@ class WorkerManager:
             except Exception:
                 LOG.warning("worker_session_teardown_failed %s", json.dumps({"session_id": session_id}, sort_keys=True))
 
-    def generate_completion_stream(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None):
+    def generate_completion_stream(self, messages: list[dict[str, Any]], max_tokens: int | None, tools: list[dict[str, Any]] | None = None, options: dict[str, Any] | None = None):
         # Note: _worker_lock is held across the full generation (including
         # yields) so concurrent worker I/O is serialized, but _state_lock is
         # released between each read, so readers stay responsive.
+        completed = False
         with self._worker_lock:
             try:
-                self._begin_worker_request_locked(messages, max_tokens, tools, stream=True)
+                self._begin_worker_request_locked(messages, max_tokens, tools, options, stream=True)
                 while True:
                     message = self._read_message(timeout_seconds=self._worker_request_timeout, timeout_metric="request_timeouts")
                     if message.get("type") == "completion_chunk":
-                        yield CompletionChunk(content=str(message.get("content", "")))
+                        yield CompletionChunk(
+                            content=str(message.get("content", "")),
+                            reasoning_content=message.get("reasoning_content") if isinstance(message.get("reasoning_content"), str) else None,
+                        )
                         continue
                     if message.get("type") == "error":
                         error = str(message.get("error", "worker_error"))
@@ -1075,8 +1172,10 @@ class WorkerManager:
                     if message.get("type") != "completion_result":
                         raise RuntimeError(f"{FAILURE_PROTOCOL}:Unexpected worker response: {message}")
 
+                    metrics = dict(message.get("metrics", {}))
                     with self._state_lock:
                         pid = self._worker_pid()
+                        self._update_backend_stats_from_metrics_locked(metrics)
                     LOG.info(
                         "worker_request_complete %s",
                         json.dumps(
@@ -1096,10 +1195,16 @@ class WorkerManager:
                         content=str(message["content"]),
                         finish_reason=str(message.get("finish_reason", "stop")),
                         usage=dict(message.get("usage", {})),
-                        metrics=dict(message.get("metrics", {})),
+                        metrics=metrics,
                         tool_calls=message.get("tool_calls"),
+                        reasoning_content=message.get("reasoning_content") if isinstance(message.get("reasoning_content"), str) else None,
                     )
+                    completed = True
                     return
+            except GeneratorExit:
+                with self._state_lock:
+                    self._terminate_process_locked(force=True)
+                raise
             except TimeoutError:
                 with self._state_lock:
                     self._terminate_process_locked(force=True)
@@ -1110,6 +1215,11 @@ class WorkerManager:
                 with self._state_lock:
                     self._terminate_process_locked(force=True)
                 raise RuntimeError(f"{FAILURE_CRASH}:Worker request crashed:{exc}") from exc
+            finally:
+                if not completed:
+                    with self._state_lock:
+                        if self._state == "busy":
+                            self._terminate_process_locked(force=True)
 
     def _start_idle_thread(self) -> None:
         """Start the background idle-unload thread.

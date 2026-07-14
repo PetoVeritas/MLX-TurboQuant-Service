@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from supervisor.main import validate_chat_request
 from supervisor.worker_manager import WorkerManager
@@ -77,6 +79,44 @@ class WorkerQueueTests(unittest.TestCase):
             validate_chat_request(payload, app),
             (409, "queue_full", "Worker queue is full (1/1)"),
         )
+
+    def test_validation_accepts_think_fields_and_rejects_unknown_level(self):
+        manager = self.make_manager(1)
+        app = type("FakeApp", (), {"worker": manager, "config": config(1)})()
+        payload = {
+            "model": manager.model_id,
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinkLevel": "medium",
+            "includeReasoning": True,
+        }
+
+        self.assertIsNone(validate_chat_request(payload, app))
+        payload["thinkLevel"] = "galaxy-brain"
+        self.assertEqual(
+            validate_chat_request(payload, app),
+            (400, "bad_request", "Field 'thinkLevel' must be one of: high, low, max, medium, minimal, none, off, xhigh"),
+        )
+
+    def test_admin_stats_surfaces_governor_drift_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp, "DEPLOYED_COMMIT")
+            marker.write_text("oldhash\n", encoding="utf-8")
+            cfg = config(0)
+            cfg["governor"]["driftCheck"] = {
+                "enabled": True,
+                "latestKnownGoodCommit": "newhash",
+                "lanes": [{"instanceId": "lane-a", "deployDir": tmp}],
+            }
+            manager = WorkerManager(cfg)
+            self.addCleanup(manager.shutdown)
+
+            with self.assertLogs("mlx_turbo_gemma.shared.governor", level="WARNING") as logs:
+                drift = manager.stats_payload()["governor"]["drift_check"]
+
+            self.assertEqual(drift["status"], "stale")
+            self.assertEqual(drift["lanes"][0]["lane_id"], "lane-a")
+            self.assertTrue(drift["lanes"][0]["stale"])
+            self.assertIn("governor_lane_drift", logs.output[0])
 
 
 if __name__ == "__main__":

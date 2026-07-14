@@ -148,6 +148,20 @@ class MessagePartTests(unittest.TestCase):
         self.assertEqual(ready["modalities"], model["modalities"])
         self.assertEqual(stats["modalities"], model["modalities"])
 
+    def test_stats_surfaces_cached_backend_memory_only_on_admin_payload(self):
+        cfg = config()
+        manager = WorkerManager(cfg)
+        self.addCleanup(manager.shutdown)
+
+        with manager._state_lock:
+            manager._update_backend_stats_locked({"memory": {"units": "GiB", "samples": {"after_load": {"weights_gb": 1.25}}}})
+
+        stats = manager.stats_payload()
+
+        self.assertEqual(stats["backend"]["memory"]["units"], "GiB")
+        self.assertEqual(stats["backend"]["memory"]["samples"]["after_load"]["weights_gb"], 1.25)
+        self.assertNotIn("backend", manager.ready_payload())
+
     def test_capability_rejection_does_not_degrade_worker(self):
         cfg = config(image_enabled=True)
         manager = WorkerManager(cfg)

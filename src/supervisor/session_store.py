@@ -16,10 +16,11 @@ DEFAULT_SESSION_POLICY = {
     "audio_seconds_per_turn": 45,
     "on_overflow": "reject",
 }
+# max_context_tokens intentionally omitted: no arbitrary internal cap on context.
+# The session honors the configured value; the real limit is the lane/model context window.
 SESSION_POLICY_CEILINGS = {
     "ttl_s": 300,
     "max_turns": 16,
-    "max_context_tokens": 20_000,
     "audio_seconds_per_turn": 45,
 }
 
@@ -82,6 +83,11 @@ class SessionStore:
             except (TypeError, ValueError):
                 value = int(policy[key])
             policy[key] = max(1, min(value, ceiling))
+        raw_ctx = raw_policy.get("max_context_tokens", policy["max_context_tokens"])
+        try:
+            policy["max_context_tokens"] = max(1, int(raw_ctx))
+        except (TypeError, ValueError):
+            policy["max_context_tokens"] = int(DEFAULT_SESSION_POLICY["max_context_tokens"])
         on_overflow = raw_policy.get("onOverflow", raw_policy.get("on_overflow", policy["on_overflow"]))
         policy["on_overflow"] = "reject" if on_overflow != "reject" else "reject"
         return policy

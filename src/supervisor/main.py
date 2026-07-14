@@ -34,8 +34,42 @@ ALLOWED_CHAT_FIELDS = {
     "tools",
     "tool_choice",
     "reasoning_effort",
+    "thinkLevel",
+    "think_level",
+    "includeReasoning",
+    "include_reasoning",
 }
 ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
+ALLOWED_THINK_LEVELS = {"off", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+ALLOWED_SPEECH_FIELDS = {
+    "model",
+    "input",
+    "voice",
+    "speaker",
+    "styleInstruction",
+    "style_instruction",
+    "instruct",
+    "referenceAudioPath",
+    "reference_audio_path",
+    "ref_audio",
+    "referenceText",
+    "reference_text",
+    "ref_text",
+    "format",
+    "sampleRateHz",
+    "timeoutSeconds",
+    "timeout_seconds",
+    "speed",
+    "postprocessSpeed",
+    "postprocess_speed",
+    "genDuration",
+    "gen_duration",
+    "durationMultiplier",
+    "duration_multiplier",
+    "maxTokens",
+    "max_tokens",
+    "stream",
+}
 
 
 class App:
@@ -164,6 +198,26 @@ def normalize_session_parts(payload: dict[str, Any], policy: dict[str, Any], con
     return normalized, None
 
 
+def validate_speech_request(payload: dict[str, Any]) -> tuple[int, str, str] | None:
+    unknown = sorted(set(payload) - ALLOWED_SPEECH_FIELDS)
+    if unknown:
+        return 400, "bad_request", f"Unsupported field(s): {', '.join(unknown)}"
+    if not isinstance(payload.get("input"), str) or not payload.get("input", "").strip():
+        return 400, "bad_request", "Field 'input' must be a non-empty string"
+    if "model" in payload and not isinstance(payload.get("model"), str):
+        return 400, "bad_request", "Field 'model' must be a string when provided"
+    if payload.get("stream") is True:
+        return 400, "unsupported_streaming", "Qwen3-TTS streaming is not wired yet"
+    if "voice" in payload and not isinstance(payload.get("voice"), dict):
+        return 400, "bad_request", "Field 'voice' must be an object when provided"
+    if "timeoutSeconds" in payload and not isinstance(payload.get("timeoutSeconds"), (int, float)):
+        return 400, "bad_request", "Field 'timeoutSeconds' must be numeric when provided"
+    for speed_field in ("postprocessSpeed", "postprocess_speed", "speed"):
+        if speed_field in payload and not isinstance(payload.get(speed_field), (int, float)):
+            return 400, "bad_request", f"Field '{speed_field}' must be numeric when provided"
+    return None
+
+
 def make_handler(app: App):
     class Handler(BaseHTTPRequestHandler):
         server_version = "MLXTurboGemma/0.1"
@@ -209,18 +263,33 @@ def make_handler(app: App):
             streamed_content = False
             for event in stream_events:
                 if isinstance(event, CompletionChunk):
-                    if not event.content:
+                    if not event.content and not event.reasoning_content:
                         continue
-                    streamed_content = True
+                    delta: dict[str, Any] = {}
+                    if event.content:
+                        streamed_content = True
+                        delta["content"] = event.content
+                    if event.reasoning_content:
+                        delta["reasoning_content"] = event.reasoning_content
                     chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [{"index": 0, "delta": {"content": event.content}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                     }
                 else:
                     final_result = event
+                    if event.reasoning_content:
+                        reasoning_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"reasoning_content": event.reasoning_content}, "finish_reason": None}],
+                        }
+                        self.wfile.write(f"data: {json.dumps(reasoning_chunk)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
                     # If the worker synthesized content into the final result
                     # (e.g. the hallucinated-tool-call break-glass message) and
                     # nothing was streamed yet, emit it as a content delta now
@@ -270,6 +339,26 @@ def make_handler(app: App):
 
         def _error(self, status: int, error_type: str, message: str, retryable: bool = False) -> None:
             self._send_json(status, {"error": {"type": error_type, "message": message, "retryable": retryable}})
+
+        def _speech_error(self, error: dict[str, Any]) -> None:
+            status = int(error.get("status", 500) or 500)
+            error_type = str(error.get("code", "generation_failed"))
+            details = dict(error.get("details", {}))
+            if status >= 500:
+                details = {
+                    key: details[key]
+                    for key in ("returncode", "timeoutSeconds", "maxTimeoutSeconds")
+                    if key in details
+                }
+            payload = {
+                "error": {
+                    "type": error_type,
+                    "message": str(error.get("message", error_type)),
+                    "retryable": status in {503, 504},
+                    "details": details,
+                }
+            }
+            self._send_json(status, payload)
 
         def _admin_allowed(self) -> bool:
             if not bool(app.config.get("server", {}).get("adminLocalOnly", True)):
@@ -471,6 +560,59 @@ def make_handler(app: App):
                     app.worker.complete_request(success=False, error=str(exc))
                     self._error(500, "internal_error", "Unexpected internal error", retryable=False)
                 return
+            if path == "/v1/audio/speech":
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                error = validate_speech_request(payload)
+                if error is not None:
+                    status, error_type, message = error
+                    self._error(status, error_type, message, retryable=False)
+                    return
+                accepted, reason = app.worker.begin_request()
+                if not accepted:
+                    self._error(409 if reason in {"worker_busy", "queue_full"} else 503, reason or "worker_not_ready", "Worker is not ready for speech generation", retryable=True)
+                    return
+                try:
+                    result = app.worker.generate_speech(payload)
+                    if result.get("type") == "speech_error":
+                        speech_error = dict(result.get("error", {}))
+                        status = int(speech_error.get("status", 500) or 500)
+                        if status >= 500:
+                            app.worker.complete_request(success=False, error=str(speech_error.get("code", "speech_error")), failure_kind=FAILURE_BACKEND)
+                        else:
+                            app.worker.complete_request_rejected(str(speech_error.get("code", "speech_error")))
+                        self._speech_error(speech_error)
+                        return
+                    app.worker.complete_request(success=True)
+                    self._send_json(
+                        200,
+                        {
+                            "id": result.get("id"),
+                            "object": result.get("object", "audio.speech"),
+                            "model": result.get("model", payload.get("model", "")),
+                            "backend": result.get("backend"),
+                            "format": result.get("format"),
+                            "sampleRateHz": result.get("sampleRateHz"),
+                            "durationSeconds": result.get("durationSeconds"),
+                            "audioPath": result.get("audioPath"),
+                            "fileSizeBytes": result.get("fileSizeBytes"),
+                            "metrics": result.get("metrics", {}),
+                        },
+                    )
+                except TimeoutError:
+                    app.worker.complete_request(success=False, error="speech_generate_timeout", failure_kind=FAILURE_TIMEOUT)
+                    self._error(504, "timeout", "Worker speech request timed out", retryable=True)
+                except RuntimeError as exc:
+                    raw_error = str(exc)
+                    failure_kind, clean_error = split_failure(raw_error)
+                    app.worker.complete_request(success=False, error=clean_error, failure_kind=failure_kind)
+                    self._error(503, "worker_failed", clean_error or raw_error, retryable=True)
+                except Exception as exc:  # pragma: no cover
+                    LOG.exception("Unexpected supervisor error during speech generation")
+                    app.worker.complete_request(success=False, error=str(exc))
+                    self._error(500, "internal_error", "Unexpected internal error", retryable=False)
+                return
             if path != "/v1/chat/completions":
                 self._error(404, "bad_request", f"Unknown path: {self.path}")
                 return
@@ -507,6 +649,7 @@ def make_handler(app: App):
                     max_tokens = payload.get("max_completion_tokens")
                 normalized_messages = normalize_messages(payload["messages"], config=app.config)
                 tools = payload.get("tools") if isinstance(payload.get("tools"), list) else None
+                generation_options = chat_generation_options(payload)
                 if payload.get("stream") is True:
                     stream_options = payload.get("stream_options")
                     include_usage = bool(
@@ -516,7 +659,7 @@ def make_handler(app: App):
                     final_result = self._send_chat_stream(
                         completion_id=completion_id,
                         model=payload["model"],
-                        stream_events=app.worker.generate_completion_stream(normalized_messages, max_tokens, tools=tools),
+                        stream_events=app.worker.generate_completion_stream(normalized_messages, max_tokens, tools=tools, options=generation_options),
                         include_usage=include_usage,
                     )
                     app.worker.complete_request(success=True)
@@ -536,7 +679,7 @@ def make_handler(app: App):
                         ),
                     )
                 else:
-                    result = app.worker.generate_completion(normalized_messages, max_tokens, tools=tools)
+                    result = app.worker.generate_completion(normalized_messages, max_tokens, tools=tools, options=generation_options)
                     app.worker.complete_request(success=True)
                     response_payload = {
                         "id": completion_id,
@@ -550,6 +693,7 @@ def make_handler(app: App):
                                     "role": "assistant",
                                     "content": None if result.tool_calls else result.content,
                                     **({"tool_calls": result.tool_calls} if result.tool_calls else {}),
+                                    **({"reasoning_content": result.reasoning_content} if result.reasoning_content else {}),
                                 },
                                 "finish_reason": result.finish_reason,
                             }
@@ -722,6 +866,14 @@ def validate_chat_request(payload: dict[str, Any], app: App) -> tuple[int, str, 
         not isinstance(payload["max_completion_tokens"], int) or payload["max_completion_tokens"] <= 0
     ):
         return 400, "bad_request", "Field 'max_completion_tokens' must be a positive integer"
+    for level_field in ("thinkLevel", "think_level", "reasoning_effort"):
+        if level_field in payload and payload[level_field] is not None and not isinstance(payload[level_field], str):
+            return 400, "bad_request", f"Field '{level_field}' must be a string when provided"
+        if isinstance(payload.get(level_field), str) and payload[level_field].strip().lower() not in ALLOWED_THINK_LEVELS:
+            return 400, "bad_request", f"Field '{level_field}' must be one of: {', '.join(sorted(ALLOWED_THINK_LEVELS))}"
+    for include_field in ("includeReasoning", "include_reasoning"):
+        if include_field in payload and not isinstance(payload[include_field], bool):
+            return 400, "bad_request", f"Field '{include_field}' must be a boolean when provided"
     if not app.worker.can_accept_requests():
         reason = app.worker.rejection_reason()
         if reason == "worker_busy":
@@ -738,6 +890,20 @@ def validate_chat_request(payload: dict[str, Any], app: App) -> tuple[int, str, 
             return 503, "worker_failed", f"Worker is cooling down after repeated failures ({remaining}s remaining)"
         return 503, "worker_failed", "Service is not ready to accept requests"
     return None
+
+
+def chat_generation_options(payload: dict[str, Any]) -> dict[str, Any]:
+    options: dict[str, Any] = {}
+    for source, target in (
+        ("thinkLevel", "thinkLevel"),
+        ("think_level", "thinkLevel"),
+        ("reasoning_effort", "reasoning_effort"),
+        ("includeReasoning", "includeReasoning"),
+        ("include_reasoning", "includeReasoning"),
+    ):
+        if source in payload:
+            options[target] = payload[source]
+    return options
 
 
 def main() -> int:

@@ -24,3 +24,42 @@ config/*.local.json
 *.swp
 *.swo
 *~
+
+# Secrets / credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+*credentials*.json
+*secret*.json
+*.token
+.netrc
+
+# Model weights / large binaries
+*.safetensors
+*.gguf
+*.bin
+*.npz
+*.mlx
+models/
+*.onnx
+*.pt
+*.ckpt
+
+# Media artifacts / generated audio
+*.wav
+*.m4a
+*.mp3
+*.ogg
+*.flac
+*.mp4
+*.mov
+*.png
+*.jpg
+*.jpeg
+media-output/
+qwen3-tts-output/

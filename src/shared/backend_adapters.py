@@ -11,6 +11,7 @@ from typing import Any
 TEXT_MODALITIES = frozenset({"text"})
 TURBOQUANT_RUNTIME_MODALITIES = frozenset({"text", "image", "audio"})
 DIFFUSION_GEMMA_RUNTIME_MODALITIES = frozenset({"text", "image"})
+QWEN3_TTS_RUNTIME_MODALITIES = frozenset({"text"})
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,11 @@ BACKEND_ADAPTERS: dict[str, BackendAdapterDescriptor] = {
         "mlx_vlm_diffusion_gemma",
         "MLX-VLM DiffusionGemma backend",
         DIFFUSION_GEMMA_RUNTIME_MODALITIES,
+    ),
+    "mlx_audio_qwen3_tts": BackendAdapterDescriptor(
+        "mlx_audio_qwen3_tts",
+        "MLX-Audio Qwen3-TTS backend",
+        QWEN3_TTS_RUNTIME_MODALITIES,
     ),
 }
 

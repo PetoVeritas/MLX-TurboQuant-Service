@@ -21,6 +21,10 @@ from typing import Any
 
 
 LOG = logging.getLogger("mlx_turbo_gemma.shared.governor")
+DEPLOYED_COMMIT_FILENAME = "DEPLOYED_COMMIT"
+DRIFT_CHECK_SOURCE_OF_TRUTH = "governor.driftCheck.latestKnownGoodCommit"
+DRIFT_CHECK_UPDATED_BY = "deployment operator or rollout automation after an approved lane deployment"
+_LAST_DRIFT_WARNING_FINGERPRINT: str | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,121 @@ class GovernorLease:
 
 class GovernorAdmissionError(RuntimeError):
     """Raised when the governor refuses a cold-load admission."""
+
+
+def evaluate_lane_version_drift(config: dict[str, Any]) -> dict[str, Any]:
+    """Read configured lane commit markers and return a non-fatal drift status."""
+
+    governor_cfg = config.get("governor", {}) if isinstance(config.get("governor", {}), dict) else {}
+    drift_cfg = governor_cfg.get("driftCheck", {}) if isinstance(governor_cfg.get("driftCheck", {}), dict) else {}
+    enabled = bool(drift_cfg.get("enabled", False))
+    payload: dict[str, Any] = {
+        "enabled": enabled,
+        "status": "disabled",
+        "source_of_truth": DRIFT_CHECK_SOURCE_OF_TRUTH,
+        "updated_by": DRIFT_CHECK_UPDATED_BY,
+        "latest_known_good_commit": str(drift_cfg.get("latestKnownGoodCommit", "")).strip(),
+        "lanes": [],
+        "summary": {"current": 0, "stale": 0, "unknown": 0},
+        "warnings": [],
+    }
+    if not enabled:
+        return payload
+
+    latest = payload["latest_known_good_commit"]
+    lanes_cfg = drift_cfg.get("lanes", [])
+    if not latest:
+        payload["status"] = "unknown"
+        payload["summary"]["unknown"] = len(lanes_cfg) if isinstance(lanes_cfg, list) else 0
+        payload["warnings"].append("missing_latest_known_good_commit")
+        return _finalize_lane_version_drift(payload)
+    if not isinstance(lanes_cfg, list) or not lanes_cfg:
+        payload["status"] = "unknown"
+        payload["warnings"].append("no_lanes_configured")
+        return _finalize_lane_version_drift(payload)
+
+    for index, lane_cfg in enumerate(lanes_cfg):
+        lane: dict[str, Any] = lane_cfg if isinstance(lane_cfg, dict) else {}
+        lane_id = str(lane.get("instanceId") or lane.get("laneId") or lane.get("id") or f"lane-{index + 1}").strip()
+        marker_path = _deployed_commit_path(lane)
+        row: dict[str, Any] = {
+            "lane_id": lane_id,
+            "marker_path": str(marker_path) if marker_path is not None else None,
+            "deployed_commit": None,
+            "status": "unknown",
+            "stale": True,
+            "warning": None,
+        }
+        if marker_path is None:
+            row["warning"] = "missing_deployed_commit_path"
+        else:
+            try:
+                deployed = marker_path.read_text(encoding="utf-8").splitlines()[0].strip()
+            except (OSError, IndexError) as exc:
+                row["warning"] = f"deployed_commit_unreadable:{exc.__class__.__name__}"
+            else:
+                row["deployed_commit"] = deployed
+                if deployed == latest:
+                    row["status"] = "current"
+                    row["stale"] = False
+                else:
+                    row["status"] = "stale"
+                    row["warning"] = "deployed_commit_behind_latest_known_good"
+
+        payload["lanes"].append(row)
+        payload["summary"][row["status"]] += 1
+        if row["warning"]:
+            payload["warnings"].append(f"{lane_id}:{row['warning']}")
+
+    payload["status"] = "current" if payload["summary"]["stale"] == 0 and payload["summary"]["unknown"] == 0 else "stale"
+    return _finalize_lane_version_drift(payload)
+
+
+def _finalize_lane_version_drift(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload["status"] not in {"stale", "unknown"}:
+        return payload
+    _emit_lane_version_drift_warning(payload)
+    return payload
+
+
+def _emit_lane_version_drift_warning(payload: dict[str, Any]) -> None:
+    global _LAST_DRIFT_WARNING_FINGERPRINT
+    fingerprint = json.dumps(
+        {
+            "latest_known_good_commit": payload["latest_known_good_commit"],
+            "status": payload["status"],
+            "summary": payload["summary"],
+            "warnings": payload["warnings"],
+        },
+        sort_keys=True,
+    )
+    if fingerprint == _LAST_DRIFT_WARNING_FINGERPRINT:
+        return
+    _LAST_DRIFT_WARNING_FINGERPRINT = fingerprint
+    LOG.warning(
+        "governor_lane_drift %s",
+        json.dumps(
+            {
+                "status": payload["status"],
+                "source_of_truth": payload["source_of_truth"],
+                "updated_by": payload["updated_by"],
+                "latest_known_good_commit": payload["latest_known_good_commit"],
+                "summary": payload["summary"],
+                "warnings": payload["warnings"],
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+def _deployed_commit_path(lane_cfg: dict[str, Any]) -> Path | None:
+    explicit = str(lane_cfg.get("deployedCommitPath", "")).strip()
+    if explicit:
+        return Path(os.path.expanduser(explicit))
+    deploy_dir = str(lane_cfg.get("deployDir", "")).strip()
+    if deploy_dir:
+        return Path(os.path.expanduser(deploy_dir)) / DEPLOYED_COMMIT_FILENAME
+    return None
 
 
 class MemoryGovernor:

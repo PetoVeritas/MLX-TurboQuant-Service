@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PORT="${QWEN3_TTS_PORT:-4037}"
+HOST="${QWEN3_TTS_HOST:-127.0.0.1}"
+BASE_URL="http://${HOST}:${PORT}"
+MODEL_PATH="${QWEN3_TTS_MODEL_PATH:-$HOME/Documents/OpenClaw Assets/Downloads - LLM Models & OC Source Code/LLM Models/mlx-community-Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit}"
+PYTHON_EXECUTABLE="${QWEN3_TTS_PYTHON:-runtime/qwen3-tts-smoke/.venv/bin/python}"
+CONFIG_FILE="${QWEN3_TTS_CONFIG:-$ROOT_DIR/tmp/qwen3-tts-dev.local.json}"
+PID_FILE="$ROOT_DIR/tmp/qwen3-tts-dev.pid"
+LOG_FILE="$ROOT_DIR/tmp/qwen3-tts-dev.log"
+OUTPUT_DIR="$ROOT_DIR/tmp/qwen3-tts-output"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/qwen3-tts-dev-test start
+  scripts/qwen3-tts-dev-test stop
+  scripts/qwen3-tts-dev-test status
+  scripts/qwen3-tts-dev-test speak "Text to render"
+  scripts/qwen3-tts-dev-test speak --instruct "Style instruction" "Text to render"
+  scripts/qwen3-tts-dev-test speak --ref-audio /path/to/reference.wav --ref-text "Reference transcript" "Text to render"
+  scripts/qwen3-tts-dev-test play "Text to render"
+  scripts/qwen3-tts-dev-test play --instruct "Style instruction" "Text to render"
+  scripts/qwen3-tts-dev-test play --ref-audio /path/to/reference.wav --ref-text "Reference transcript" "Text to render"
+
+Environment overrides:
+  QWEN3_TTS_PORT        default 4037
+  QWEN3_TTS_MODEL_PATH  path to the downloaded MLX Qwen3-TTS model
+  QWEN3_TTS_PYTHON      default runtime/qwen3-tts-smoke/.venv/bin/python
+  QWEN3_TTS_INSTRUCT    optional emotion/style instruction
+  QWEN3_TTS_REF_AUDIO   optional local reference WAV path
+  QWEN3_TTS_REF_TEXT    optional reference transcript
+USAGE
+}
+
+write_config() {
+  mkdir -p "$ROOT_DIR/tmp" "$OUTPUT_DIR"
+  SERVICE_ROOT="$ROOT_DIR" MODEL_PATH="$MODEL_PATH" PYTHON_EXECUTABLE="$PYTHON_EXECUTABLE" OUTPUT_DIR="$OUTPUT_DIR" HOST="$HOST" PORT="$PORT" CONFIG_FILE="$CONFIG_FILE" python3 - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+model_name = Path(os.environ["MODEL_PATH"]).name
+model_id = "qwen3-tts-local-1.7b-base-8bit" if "Base-8bit" in model_name else "qwen3-tts-local-1.7b-customvoice-4bit"
+
+config = {
+    "server": {
+        "host": os.environ["HOST"],
+        "port": int(os.environ["PORT"]),
+        "adminLocalOnly": True,
+    },
+    "model": {
+        "id": model_id,
+        "path": os.environ["MODEL_PATH"],
+    },
+    "worker": {
+        "backend": "mlx_audio_qwen3_tts",
+        "pythonExecutable": "/opt/homebrew/bin/python3",
+        "stubMode": False,
+        "lazyLoad": True,
+        "requestTimeoutMs": 180000,
+        "idleUnload": {
+            "enabled": False,
+            "idleMs": 300000,
+        },
+    },
+    "speech": {
+        "serviceRoot": os.environ["SERVICE_ROOT"],
+        "modelPath": os.environ["MODEL_PATH"],
+        "pythonExecutable": os.environ["PYTHON_EXECUTABLE"],
+        "outputDir": os.environ["OUTPUT_DIR"],
+        "maxInputChars": 4000,
+        "defaultTimeoutSeconds": 120,
+        "maxTimeoutSeconds": 175,
+        "retentionMaxFiles": 50,
+    },
+    "governor": {
+        "enabled": False,
+    },
+    "logging": {
+        "level": "info",
+    },
+}
+
+path = Path(os.environ["CONFIG_FILE"])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+is_running() {
+  [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+port_has_listener() {
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+start_server() {
+  write_config
+  if is_running; then
+    echo "Qwen3-TTS dev server already running at $BASE_URL with pid $(cat "$PID_FILE")"
+    return
+  fi
+  rm -f "$PID_FILE"
+  if port_has_listener; then
+    echo "Port $PORT is already in use; set QWEN3_TTS_PORT or stop the existing listener." >&2
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2 || true
+    exit 1
+  fi
+  cd "$ROOT_DIR"
+  nohup env MLX_GEMMA_CONFIG="$CONFIG_FILE" PYTHONPATH=src python3 -m supervisor.main >>"$LOG_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+  for _ in {1..80}; do
+    if ! is_running; then
+      echo "Qwen3-TTS dev server failed to start. Log: $LOG_FILE" >&2
+      rm -f "$PID_FILE"
+      tail -40 "$LOG_FILE" >&2 || true
+      exit 1
+    fi
+    if curl -fsS "$BASE_URL/ready" >/dev/null 2>&1; then
+      echo "Qwen3-TTS dev server ready at $BASE_URL with pid $(cat "$PID_FILE")"
+      return
+    fi
+    sleep 0.25
+  done
+  echo "Qwen3-TTS dev server did not become ready in time. Log: $LOG_FILE" >&2
+  exit 1
+}
+
+stop_server() {
+  if ! [[ -f "$PID_FILE" ]]; then
+    echo "Qwen3-TTS dev server not running"
+    return
+  fi
+  pid="$(cat "$PID_FILE")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    for _ in {1..40}; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$PID_FILE"
+        echo "Stopped Qwen3-TTS dev server pid $pid"
+        return
+      fi
+      sleep 0.25
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  echo "Stopped Qwen3-TTS dev server pid $pid"
+}
+
+status_server() {
+  if is_running; then
+    echo "Qwen3-TTS dev server pid $(cat "$PID_FILE") at $BASE_URL"
+  else
+    echo "Qwen3-TTS dev server not running"
+  fi
+  curl -fsS "$BASE_URL/ready" 2>/dev/null || true
+  echo
+}
+
+render_speech() {
+  local mode="$1"
+  shift
+  local instruct="${QWEN3_TTS_INSTRUCT:-}"
+  local ref_audio="${QWEN3_TTS_REF_AUDIO:-}"
+  local ref_text="${QWEN3_TTS_REF_TEXT:-}"
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      --instruct)
+        if [[ $# -lt 2 ]]; then
+          echo "--instruct requires an instruction string" >&2
+          exit 2
+        fi
+        instruct="$2"
+        shift 2
+        ;;
+      --ref-audio)
+        if [[ $# -lt 2 ]]; then
+          echo "--ref-audio requires a local WAV path" >&2
+          exit 2
+        fi
+        ref_audio="$2"
+        shift 2
+        ;;
+      --ref-text)
+        if [[ $# -lt 2 ]]; then
+          echo "--ref-text requires a transcript string" >&2
+          exit 2
+        fi
+        ref_text="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  local text="${*:-Qwen three T T S dev smoke test. This is a local development render.}"
+  start_server >/dev/null
+  TEXT="$text" INSTRUCT="$instruct" REF_AUDIO="$ref_audio" REF_TEXT="$ref_text" BASE_URL="$BASE_URL" MODE="$mode" python3 - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+payload = {
+    "model": "qwen3-tts-local-1.7b-customvoice-4bit",
+    "input": os.environ["TEXT"],
+    "speaker": "aiden",
+    "format": "wav",
+    "timeoutSeconds": 120,
+}
+if os.environ.get("INSTRUCT", "").strip():
+    payload["instruct"] = os.environ["INSTRUCT"].strip()
+if os.environ.get("REF_AUDIO", "").strip():
+    payload["referenceAudioPath"] = os.environ["REF_AUDIO"].strip()
+if os.environ.get("REF_TEXT", "").strip():
+    payload["referenceText"] = os.environ["REF_TEXT"].strip()
+body = json.dumps(payload).encode("utf-8")
+request = urllib.request.Request(
+    os.environ["BASE_URL"] + "/v1/audio/speech",
+    data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=180) as response:
+        data = json.loads(response.read().decode("utf-8"))
+except urllib.error.HTTPError as exc:
+    sys.stderr.write(exc.read().decode("utf-8") + "\n")
+    raise SystemExit(1)
+
+print(json.dumps(data, indent=2))
+audio_path = data.get("audioPath")
+if audio_path and os.environ["MODE"] == "play":
+    subprocess.run(["open", audio_path], check=False)
+PY
+}
+
+command="${1:-}"
+case "$command" in
+  start)
+    start_server
+    ;;
+  stop)
+    stop_server
+    ;;
+  status)
+    status_server
+    ;;
+  speak)
+    shift
+    render_speech "speak" "$@"
+    ;;
+  play)
+    shift
+    render_speech "play" "$@"
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
